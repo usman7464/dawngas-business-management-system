@@ -55,12 +55,4 @@ npm run smoke
 - `BACKUP_STORAGE_PATH`
 - `UPLOAD_STORAGE_PATH`
 
-## Recent Fixes
 
-- MongoDB-backed item types, units, storage locations, categories, and item behavior.
-- Dynamic Add Item form with sectioned product/service/inventory/BOM behavior.
-- Structured bill-of-materials table.
-- Logo-only sidebar branding with optional logo + business name setting.
-- Mobile sidebar drawer with hamburger, close button, overlay close, and Escape close.
-- Tokenized PDF share links for WhatsApp invoice, receipt, customer statement, and report sharing.
-- Branded dependency-free PDF responses for invoices, receipts, statements, and reports.
