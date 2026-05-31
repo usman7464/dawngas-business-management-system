@@ -1,0 +1,21 @@
+{
+  "name": "dawngas-business-management-system",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Owner-only business management dashboard for DawnGas.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "smoke": "node scripts/smoke-test.js",
+    "migrate:json-to-mongo": "node scripts/migrate-json-to-mongodb.js",
+    "seed:demo": "node scripts/seed-demo-data.js",
+    "demo:reset": "node scripts/reset-demo-data.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "mongodb": "^7.2.0"
+  }
+}
