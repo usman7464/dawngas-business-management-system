@@ -99,6 +99,27 @@ function request(method, path, body, cookie = "") {
   );
   if (!rawMaterial.body.success || !rawMaterial.body.product.stock) throw new Error("Raw material creation failed.");
 
+  const inventoryByLocationValue = await request("GET", `/api/inventory?storageLocation=${encodeURIComponent("smoke_store")}`, null, cookie);
+  if (!inventoryByLocationValue.body.success || !inventoryByLocationValue.body.inventory.some((item) => item.productId === rawMaterial.body.product.id)) {
+    throw new Error("Inventory storage location filter by value failed.");
+  }
+
+  const inventoryByLocationLabel = await request("GET", `/api/inventory?storageLocation=${encodeURIComponent("Smoke Store")}`, null, cookie);
+  if (!inventoryByLocationLabel.body.success || !inventoryByLocationLabel.body.inventory.some((item) => item.productId === rawMaterial.body.product.id)) {
+    throw new Error("Inventory storage location filter by label failed.");
+  }
+
+  const warehouseLocation = await request("POST", "/api/master-data/storage-locations", { label: "Smoke Warehouse", value: "smoke_warehouse", code: "SMW" }, cookie);
+  if (!warehouseLocation.body.success) throw new Error("Secondary storage location creation failed.");
+
+  const inventoryLocationPatch = await request("PATCH", `/api/inventory/${rawMaterial.body.product.stock.id}`, { storageLocation: "smoke_warehouse" }, cookie);
+  if (!inventoryLocationPatch.body.success || inventoryLocationPatch.body.inventory.storageLocationName !== "Smoke Warehouse") throw new Error("Inventory storage location update failed.");
+
+  const inventoryByWarehouse = await request("GET", `/api/inventory?storageLocation=${encodeURIComponent("smoke_warehouse")}`, null, cookie);
+  if (!inventoryByWarehouse.body.success || !inventoryByWarehouse.body.inventory.some((item) => item.productId === rawMaterial.body.product.id)) {
+    throw new Error("Inventory storage location filter after location change failed.");
+  }
+
   const finishedProduct = await request(
     "POST",
     "/api/products",
@@ -203,7 +224,13 @@ function request(method, path, body, cookie = "") {
     },
     cookie
   );
-  if (!invoice.body.success || !["ISSUED", "PARTIAL", "PAID"].includes(invoice.body.invoice.status)) throw new Error("Invoice creation/issue failed.");
+  if (
+    !invoice.body.success ||
+    invoice.body.invoice.status !== "ISSUED" ||
+    invoice.body.invoice.paymentStatus !== "UNPAID" ||
+    invoice.body.invoice.paidAmount !== 0 ||
+    invoice.body.invoice.balanceAmount !== 8400
+  ) throw new Error("Invoice creation/automatic unpaid status failed.");
 
   const firstInvoiceUnitPrice = invoice.body.invoice.items[0].unitPrice;
   if (firstInvoiceUnitPrice !== 4200) throw new Error("New invoice did not snapshot the current product price.");
@@ -268,6 +295,40 @@ function request(method, path, body, cookie = "") {
   );
   if (!payment.body.success) throw new Error("Payment creation failed.");
 
+  const partialInvoice = await request("GET", `/api/invoices/${invoice.body.invoice.id}`, null, cookie);
+  if (
+    !partialInvoice.body.success ||
+    partialInvoice.body.invoice.paymentStatus !== "PARTIAL" ||
+    partialInvoice.body.invoice.status !== "ISSUED" ||
+    partialInvoice.body.invoice.paidAmount !== 2500 ||
+    partialInvoice.body.invoice.balanceAmount !== 5900
+  ) throw new Error("Partial payment did not update invoice automatically.");
+
+  const overPayment = await request(
+    "POST",
+    "/api/payments",
+    { customerId: customer.body.customer.id, invoiceId: invoice.body.invoice.id, amount: 999999, paymentMethod: "CASH" },
+    cookie
+  );
+  if (overPayment.status !== 400) throw new Error("Invoice overpayment validation failed.");
+
+  const remainingPayment = await request(
+    "POST",
+    "/api/payments",
+    { customerId: customer.body.customer.id, invoiceId: invoice.body.invoice.id, amount: partialInvoice.body.invoice.balanceAmount, paymentMethod: "BANK_TRANSFER" },
+    cookie
+  );
+  if (!remainingPayment.body.success) throw new Error("Remaining payment creation failed.");
+
+  const paidInvoice = await request("GET", `/api/invoices/${invoice.body.invoice.id}`, null, cookie);
+  if (
+    !paidInvoice.body.success ||
+    paidInvoice.body.invoice.paymentStatus !== "PAID" ||
+    paidInvoice.body.invoice.status !== "ISSUED" ||
+    paidInvoice.body.invoice.paidAmount !== 8400 ||
+    paidInvoice.body.invoice.balanceAmount !== 0
+  ) throw new Error("Full payment did not update invoice automatically.");
+
   const receiptUpload = await request(
     "POST",
     "/api/uploads",
@@ -300,6 +361,12 @@ function request(method, path, body, cookie = "") {
   const expenseReceipt = await request("GET", `/api/uploads/${receiptUpload.body.file.id}`, null, cookie);
   if (expenseReceipt.status !== 200) throw new Error("Expense receipt download failed.");
 
+  const removeExpenseAttachment = await request("DELETE", `/api/expenses/${expense.body.expense.id}/attachment`, {}, cookie);
+  if (!removeExpenseAttachment.body.success || removeExpenseAttachment.body.expense.receiptFileId) throw new Error("Expense attachment removal failed.");
+
+  const removedExpenseReceipt = await request("GET", `/api/uploads/${receiptUpload.body.file.id}`, null, cookie);
+  if (removedExpenseReceipt.status !== 404) throw new Error("Removed expense receipt remained downloadable.");
+
   const report = await request("GET", `/api/reports/summary?from=2026-01-01&to=2026-12-31`, null, cookie);
   if (!report.body.success || report.body.report.totals.orders < 1 || report.body.report.totals.invoices < 1) throw new Error("Report calculation failed.");
 
@@ -309,14 +376,26 @@ function request(method, path, body, cookie = "") {
   const inventoryFilter = await request("GET", `/api/inventory?search=${encodeURIComponent("Smoke Test 2 Burner Stove")}&itemType=FINISHED_PRODUCT`, null, cookie);
   if (!inventoryFilter.body.success || !inventoryFilter.body.inventory.length) throw new Error("Inventory filters failed.");
 
+  const productCsv = await request("GET", "/api/exports/products/csv", null, cookie);
+  if (productCsv.status !== 200 || !String(productCsv.body).includes("Product Export") || String(productCsv.body).includes("undefined")) throw new Error("Product CSV formatting failed.");
+
+  const inventoryCsv = await request("GET", "/api/exports/inventory/csv", null, cookie);
+  if (inventoryCsv.status !== 200 || !String(inventoryCsv.body).includes("Storage Location") || !String(inventoryCsv.body).includes("Smoke Warehouse")) throw new Error("Inventory CSV formatting failed.");
+
+  const reportCsv = await request("GET", "/api/reports/summary/csv?from=2026-01-01&to=2026-12-31", null, cookie);
+  if (reportCsv.status !== 200 || !String(reportCsv.body).includes("Unpaid Invoices") || String(reportCsv.body).includes("unpaidInvoices")) throw new Error("Report CSV labels failed.");
+
   const invoicePrint = await request("GET", `/api/invoices/${invoice.body.invoice.id}/print`, null, cookie);
   if (invoicePrint.status !== 200 || !String(invoicePrint.body || "").includes("Invoice")) throw new Error("Invoice print failed.");
+  if (/localhost|\/api\/invoices/.test(String(invoicePrint.body || ""))) throw new Error("Invoice print exposed a route or localhost path.");
+  if (!String(invoicePrint.body || "").includes("Payment Status")) throw new Error("Invoice print is missing payment status.");
 
   const invoicePdf = await request("GET", `/api/invoices/${invoice.body.invoice.id}/pdf`, null, cookie);
   if (invoicePdf.status !== 200) throw new Error("Invoice PDF failed.");
 
   const receiptPrint = await request("GET", `/api/payments/${payment.body.payment.id}/receipt/print`, null, cookie);
   if (receiptPrint.status !== 200 || !String(receiptPrint.body || "").includes("Receipt")) throw new Error("Receipt print failed.");
+  if (/localhost|\/api\/payments/.test(String(receiptPrint.body || ""))) throw new Error("Receipt print exposed a route or localhost path.");
 
   const receiptPdf = await request("GET", `/api/payments/${payment.body.payment.id}/receipt/pdf`, null, cookie);
   if (receiptPdf.status !== 200) throw new Error("Receipt PDF failed.");
@@ -362,6 +441,38 @@ function request(method, path, body, cookie = "") {
 
   const restore = await request("POST", `/api/recycle-bin/expenses/${expense.body.expense.id}/restore`, {}, cookie);
   if (!restore.body.success) throw new Error("Recycle restore failed.");
+
+  const archiveProductForRecycle = await request("PATCH", `/api/products/${finishedProduct.body.product.id}/archive`, {}, cookie);
+  if (!archiveProductForRecycle.body.success) throw new Error("Product archive for blocked recycle test failed.");
+
+  const blockedProductDelete = await request("DELETE", `/api/recycle-bin/products/${finishedProduct.body.product.id}/permanent`, {}, cookie);
+  const dependencyTypes = (blockedProductDelete.body.dependencies || []).map((item) => item.type);
+  if (
+    blockedProductDelete.status !== 409 ||
+    !Array.isArray(blockedProductDelete.body.dependencies) ||
+    !dependencyTypes.includes("Inventory Movements") ||
+    !dependencyTypes.includes("Invoice Items")
+  ) throw new Error("Blocked permanent delete did not return dependency details.");
+
+  const activityAfterBlockedDelete = await request("GET", "/api/activity-logs", null, cookie);
+  if (!activityAfterBlockedDelete.body.activityLogs.some((log) => log.action === "record_permanent_delete_blocked" && log.entityId === finishedProduct.body.product.id)) {
+    throw new Error("Blocked permanent delete activity log was not created.");
+  }
+
+  const restoreProductAfterBlockedDelete = await request("POST", `/api/recycle-bin/products/${finishedProduct.body.product.id}/restore`, {}, cookie);
+  if (!restoreProductAfterBlockedDelete.body.success) throw new Error("Product restore after blocked delete failed.");
+
+  const note = await request("POST", "/api/notes", { entityType: "customer", entityId: customer.body.customer.id, title: "Smoke recycle note", content: "Permanent delete smoke check" }, cookie);
+  if (!note.body.success) throw new Error("Note creation failed.");
+
+  const archiveNote = await request("PATCH", `/api/notes/${note.body.note.id}/archive`, {}, cookie);
+  if (!archiveNote.body.success) throw new Error("Note archive failed.");
+
+  const permanentDeleteNote = await request("DELETE", `/api/recycle-bin/notes/${note.body.note.id}/permanent`, {}, cookie);
+  if (!permanentDeleteNote.body.success) throw new Error("Recycle permanent delete failed.");
+
+  const recycleAfterPermanentDelete = await request("GET", "/api/recycle-bin", null, cookie);
+  if (recycleAfterPermanentDelete.body.items.some((item) => item.record.id === note.body.note.id)) throw new Error("Permanently deleted note still appears in recycle bin.");
 
   const dashboard = await request("GET", "/api/dashboard/summary", null, cookie);
   if (!dashboard.body.success) throw new Error("Dashboard failed.");

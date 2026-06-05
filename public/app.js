@@ -8,7 +8,9 @@ const state = {
   settings: null,
   masterData: null,
   searchTimer: null,
-  sidebarEscapeBound: false
+  sidebarEscapeBound: false,
+  sidebarResizeBound: false,
+  sidebarCollapsed: false
 };
 
 const navItems = [
@@ -85,6 +87,16 @@ function money(value) {
   return `${currency} ${Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function numberValue(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function inputNumber(value) {
+  const number = numberValue(value);
+  return number ? String(Math.round(number * 100) / 100) : "";
+}
+
 function date(value) {
   return value ? String(value).slice(0, 10) : "";
 }
@@ -129,7 +141,10 @@ async function api(path, options = {}) {
   const data = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
     const message = typeof data === "string" ? data : data.message || "Request failed.";
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    error.data = data;
+    throw error;
   }
   return data;
 }
@@ -264,7 +279,7 @@ function openModal(title, body, onSubmit, submitLabel = "Save") {
       <div class="modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
         <div class="modal-head">
           <h3>${escapeHtml(title)}</h3>
-          <button class="icon-button" data-close-modal aria-label="Close">X</button>
+          <button class="icon-button modal-close" data-close-modal aria-label="Close dialog">Close</button>
         </div>
         <form data-modal-form>
           <div class="modal-body">${body}</div>
@@ -283,10 +298,17 @@ function openModal(title, body, onSubmit, submitLabel = "Save") {
     submit.disabled = true;
     submit.textContent = "Saving...";
     try {
-      await onSubmit(event.currentTarget);
+      const result = await onSubmit(event.currentTarget);
+      if (result?.keepOpen) {
+        if (modalRoot.contains(submit)) {
+          submit.disabled = false;
+          submit.textContent = submitLabel;
+        }
+        return;
+      }
       closeModal();
-      toast("Saved.");
-      await renderRoute();
+      if (result?.toast !== false) toast(result?.toast || "Saved.");
+      if (result?.refresh !== false) await renderRoute();
     } catch (error) {
       toast(error.message);
       submit.disabled = false;
@@ -295,14 +317,85 @@ function openModal(title, body, onSubmit, submitLabel = "Save") {
   });
 }
 
-function confirmAction(message, onConfirm) {
+function openInfoModal(title, body, closeLabel = "Close") {
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop">
+      <div class="modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}">
+        <div class="modal-head">
+          <h3>${escapeHtml(title)}</h3>
+          <button class="icon-button modal-close" data-close-modal aria-label="Close dialog">Close</button>
+        </div>
+        <div class="modal-body">${body}</div>
+        <div class="modal-foot">
+          <button type="button" class="button primary" data-close-modal>${escapeHtml(closeLabel)}</button>
+        </div>
+      </div>
+    </div>
+  `;
+  modalRoot.querySelectorAll("[data-close-modal]").forEach((button) => button.addEventListener("click", closeModal));
+}
+
+function confirmAction(message, onConfirm, options = {}) {
   openModal(
-    "Confirm action",
-    `<p>${escapeHtml(message)}</p>`,
+    options.title || "Confirm action",
+    `<p class="${options.danger ? "danger-copy" : ""}">${escapeHtml(message)}</p>`,
     async () => {
-      await onConfirm();
+      return await onConfirm();
     },
-    "Confirm"
+    options.submitLabel || "Confirm"
+  );
+  if (options.danger) {
+    const submit = modalRoot.querySelector("button[type='submit']");
+    submit?.classList.remove("primary");
+    submit?.classList.add("danger");
+  }
+}
+
+function dependencySummaryHtml(dependencies = []) {
+  if (!dependencies.length) return `<div class="empty compact">No dependency details were returned.</div>`;
+  return `
+    <ul class="dependency-list">
+      ${dependencies.map((item) => `<li><span>${escapeHtml(item.type)}</span><strong>${escapeHtml(item.count)}</strong></li>`).join("")}
+    </ul>
+  `;
+}
+
+function showCannotDeleteRecordModal(data = {}) {
+  openInfoModal(
+    "Cannot Delete Record",
+    `
+      <div class="dependency-warning">
+        <h4>This record is connected to business history and cannot be permanently deleted.</h4>
+        <p>${escapeHtml(data.message || "Permanent delete is blocked because this item is connected to business history.")}</p>
+      </div>
+      <h4 class="section-mini-title">Linked records</h4>
+      ${dependencySummaryHtml(data.dependencies || [])}
+      <h4 class="section-mini-title">Suggested actions</h4>
+      <ul class="suggested-actions">
+        <li>Keep the record archived.</li>
+        <li>Restore the record if you need to use it again.</li>
+        <li>Create a new corrected record instead of deleting business history.</li>
+      </ul>
+    `,
+    "Close"
+  );
+}
+
+function confirmPermanentDelete(type, id) {
+  confirmAction(
+    "Permanently deleting this record cannot be undone. If this record is linked to invoices, payments, purchases, production, or inventory history, deletion may be blocked to protect business records.",
+    async () => {
+      try {
+        await api(`/api/recycle-bin/${type}/${id}/permanent`, { method: "DELETE", body: {} });
+      } catch (error) {
+        if (error.status === 409) {
+          showCannotDeleteRecordModal(error.data || { message: error.message });
+          return { keepOpen: true };
+        }
+        throw error;
+      }
+    },
+    { title: "Delete permanently?", submitLabel: "Delete Permanently", danger: true }
   );
 }
 
@@ -402,13 +495,49 @@ function sidebarBrandMarkup() {
   return `<div class="brand-fallback">${escapeHtml(settings.businessName || "DawnGas")}</div>`;
 }
 
+function isDrawerSidebar() {
+  return window.matchMedia("(max-width: 980px)").matches;
+}
+
+function updateSidebarToggleState() {
+  const toggle = document.querySelector("[data-toggle-sidebar]");
+  if (!toggle) return;
+  const drawer = isDrawerSidebar();
+  const open = document.body.classList.contains("sidebar-open");
+  const collapsed = state.sidebarCollapsed && !drawer;
+  const label = drawer ? "Open menu" : collapsed ? "Expand sidebar" : "Collapse sidebar";
+  toggle.setAttribute("aria-label", label);
+  toggle.setAttribute("title", label);
+  toggle.setAttribute("aria-expanded", drawer ? (open ? "true" : "false") : (!collapsed ? "true" : "false"));
+}
+
+function applySidebarCollapsed() {
+  document.body.classList.toggle("sidebar-collapsed", state.sidebarCollapsed && !isDrawerSidebar());
+  updateSidebarToggleState();
+}
+
+function setSidebarCollapsed(collapsed) {
+  state.sidebarCollapsed = collapsed;
+  applySidebarCollapsed();
+}
+
 function setSidebarOpen(open) {
   const sidebar = document.querySelector("[data-sidebar]");
-  const toggle = document.querySelector("[data-toggle-sidebar]");
   if (!sidebar) return;
-  sidebar.classList.toggle("open", open);
-  document.body.classList.toggle("sidebar-open", open);
-  toggle?.setAttribute("aria-expanded", open ? "true" : "false");
+  const drawer = isDrawerSidebar();
+  sidebar.classList.toggle("open", drawer && open);
+  document.body.classList.toggle("sidebar-open", drawer && open);
+  updateSidebarToggleState();
+}
+
+function toggleSidebar() {
+  const sidebar = document.querySelector("[data-sidebar]");
+  if (isDrawerSidebar()) {
+    setSidebarOpen(!sidebar?.classList.contains("open"));
+  } else {
+    setSidebarOpen(false);
+    setSidebarCollapsed(!state.sidebarCollapsed);
+  }
 }
 
 function closeSidebar() {
@@ -532,10 +661,10 @@ function renderShell() {
       <aside class="sidebar" data-sidebar>
         <div class="brand-block">
           ${sidebarBrandMarkup()}
-          <button class="icon-button sidebar-close" data-close-sidebar aria-label="Close menu"><span class="close-mark" aria-hidden="true"></span></button>
+          <button class="icon-button sidebar-close" data-close-sidebar aria-label="Close menu"><span class="sidebar-close-icon" aria-hidden="true"></span><span class="sidebar-close-label">Close menu</span></button>
         </div>
         <nav class="nav-list">
-          ${navItems.map(([key, label]) => `<button class="nav-button" data-route="${key}"><span class="nav-dot"></span>${label}</button>`).join("")}
+          ${navItems.map(([key, label]) => `<button class="nav-button" data-route="${key}" title="${escapeHtml(label)}"><span class="nav-dot"></span><span class="nav-label">${escapeHtml(label)}</span></button>`).join("")}
         </nav>
       </aside>
       <main class="main">
@@ -556,10 +685,10 @@ function renderShell() {
   document.querySelectorAll("[data-route]").forEach((button) => {
     button.addEventListener("click", () => {
       location.hash = button.dataset.route;
-      closeSidebar();
+      if (isDrawerSidebar()) closeSidebar();
     });
   });
-  document.querySelector("[data-toggle-sidebar]").addEventListener("click", () => setSidebarOpen(!document.querySelector("[data-sidebar]").classList.contains("open")));
+  document.querySelector("[data-toggle-sidebar]").addEventListener("click", toggleSidebar);
   document.querySelector("[data-close-sidebar]").addEventListener("click", closeSidebar);
   document.querySelector("[data-sidebar-overlay]").addEventListener("click", closeSidebar);
   if (!state.sidebarEscapeBound) {
@@ -568,6 +697,15 @@ function renderShell() {
     });
     state.sidebarEscapeBound = true;
   }
+  if (!state.sidebarResizeBound) {
+    window.addEventListener("resize", () => {
+      if (!isDrawerSidebar()) setSidebarOpen(false);
+      applySidebarCollapsed();
+    });
+    state.sidebarResizeBound = true;
+  }
+  applySidebarCollapsed();
+  updateSidebarToggleState();
   document.querySelector("[data-logout]").addEventListener("click", logout);
   setupSearch();
 }
@@ -990,7 +1128,7 @@ async function openProductForm(product = {}) {
   const type = product.itemType || "FINISHED_PRODUCT";
   const behavior = itemTypeBehavior(type);
   const defaultUnit = product.unitOfMeasure || behavior.defaultUnitOfMeasure || units.find((item) => item.record?.isDefault)?.value || units[0]?.value || "piece";
-  const defaultLocation = product.stock?.storageLocation || locations.find((item) => item.record?.isDefault)?.value || locations[0]?.value || "";
+  const defaultLocation = product.stock?.storageLocation || locations.find((item) => item.record?.id === product.stock?.storageLocationId)?.value || locations.find((item) => item.record?.isDefault)?.value || locations[0]?.value || "";
   const unitOptionsForForm = units.length ? units : [{ value: defaultUnit, label: "No units added yet" }];
   const locationOptionsForForm = locations.length ? locations : [{ value: "", label: "No storage locations added yet" }];
   openModal(
@@ -1034,10 +1172,10 @@ async function openProductForm(product = {}) {
         </div>
       </section>
       <section class="form-section" data-production-section>
-        <div class="form-section-head"><h4>Production / Bill of Materials</h4><p>Define which raw materials or spare parts are required to produce this item.</p></div>
+        <div class="form-section-head"><h4>Production / Materials Required</h4><p>Define which raw materials or spare parts are required to produce this item.</p></div>
         <div class="form-grid">
           ${formToggle("canBeProduced", "Can be Produced / Assembled", product.canBeProduced || false, "Turn this on if this item is made from components.")}
-          ${formToggle("hasBillOfMaterials", "Bill of Materials Enabled", product.hasBillOfMaterials || false, "Turn this on to define component rows.")}
+          ${formToggle("hasBillOfMaterials", "Materials Required Enabled", product.hasBillOfMaterials || false, "Turn this on to define component rows.")}
         </div>
         <div class="bom-editor" data-bom-editor>
           ${renderBomEditor(product.bom || [], bomComponents, units)}
@@ -1093,7 +1231,7 @@ async function renderInventory(filters = {}) {
         { label: "Available", value: (row) => `<span class="number">${row.availableStock}</span>` },
         { label: "Threshold", value: "lowStockThreshold" },
         { label: "Reorder", value: "reorderQuantity" },
-        { label: "Location", value: (row) => escapeHtml(row.storageLocation || "") },
+        { label: "Location", value: (row) => escapeHtml(row.storageLocationName || row.storageLocationSnapshotName || row.storageLocation || "") },
         { label: "Last Movement", value: (row) => date(row.lastMovementAt || row.updatedAt) },
         { label: "Status", value: (row) => badge(row.status) },
         { label: "Actions", value: (row) => `<button class="button" data-adjust-item="${row.productId}">Adjust</button> <button class="button" data-history-inventory="${row.id}">History</button> <button class="button" data-edit-inventory="${row.id}">Edit</button>` }
@@ -1173,12 +1311,13 @@ async function customerOptions() {
 async function openInventoryEdit(item) {
   const locations = await masterOptions("storageLocations", []);
   const locationOptions = locations.length ? locations : [{ value: "", label: "No storage locations added yet" }];
+  const selectedLocation = item.storageLocation || locations.find((option) => option.record?.id === item.storageLocationId)?.value || "";
   openModal(
     "Edit inventory",
     `<div class="form-grid">
       ${formInput("lowStockThreshold", "Low stock threshold", item.lowStockThreshold || 0, "number")}
       ${formInput("reorderQuantity", "Reorder quantity", item.reorderQuantity || 0, "number")}
-      ${formSelect("storageLocation", "Storage location", locationOptions, item.storageLocation || "")}
+      ${formSelect("storageLocation", "Storage location", locationOptions, selectedLocation)}
       ${formTextarea("notes", "Notes", item.notes || "")}
     </div>`,
     async (form) => api(`/api/inventory/${item.id}`, { method: "PATCH", body: formValues(form) })
@@ -1203,7 +1342,7 @@ async function openStockAdjustment(defaults = {}) {
 function renderBomEditor(rows, components, units) {
   if (!components.length) {
     return `
-      <div class="empty compact">No raw materials or spare parts are available yet. Add raw materials first before creating a bill of materials.</div>
+      <div class="empty compact">No raw materials or spare parts are available yet. Add raw materials first before creating materials required for production.</div>
       <button class="button" type="button" data-add-raw-material>Add Raw Material</button>
     `;
   }
@@ -1449,9 +1588,9 @@ async function openProductionDetail(id) {
 }
 
 async function renderSuppliers() {
-  setContent(pageShell("Suppliers", "Track suppliers for raw materials, spare parts, and purchased stock.", `<button class="button primary" data-add-supplier>Add Supplier</button>`));
+  setContent(pageShell("Suppliers", "Track suppliers for raw materials, spare parts, and purchased stock.", `<button class="button primary" data-add-supplier>Add Supplier</button><button class="button" data-export-suppliers>Export CSV</button>`));
   const data = await api("/api/suppliers");
-  setContent(pageShell("Suppliers", "Track suppliers for raw materials, spare parts, and purchased stock.", `<button class="button primary" data-add-supplier>Add Supplier</button>`, table(
+  setContent(pageShell("Suppliers", "Track suppliers for raw materials, spare parts, and purchased stock.", `<button class="button primary" data-add-supplier>Add Supplier</button><button class="button" data-export-suppliers>Export CSV</button>`, table(
     [
       { label: "Supplier", value: (row) => `<strong>${escapeHtml(row.name)}</strong><br><small>${escapeHtml(row.phone || "")}</small>` },
       { label: "Contact Person", value: (row) => escapeHtml(row.contactPerson || "") },
@@ -1464,6 +1603,7 @@ async function renderSuppliers() {
     "No suppliers yet. Add suppliers to track purchases and raw material sources."
   )));
   document.querySelector("[data-add-supplier]").addEventListener("click", () => openSupplierForm());
+  document.querySelector("[data-export-suppliers]").addEventListener("click", () => window.open("/api/exports/suppliers/csv", "_blank"));
   document.querySelectorAll("[data-edit-supplier]").forEach((button) => button.addEventListener("click", () => openSupplierForm(data.suppliers.find((item) => item.id === button.dataset.editSupplier))));
   document.querySelectorAll("[data-archive-supplier]").forEach((button) => button.addEventListener("click", () => confirmAction("Archive this supplier?", async () => api(`/api/suppliers/${button.dataset.archiveSupplier}/archive`, { method: "PATCH", body: {} }))));
 }
@@ -1487,9 +1627,9 @@ function openSupplierForm(supplier = {}) {
 }
 
 async function renderPurchases() {
-  setContent(pageShell("Purchases", "Receive stock from suppliers and update inventory.", `<button class="button primary" data-add-purchase>Create Purchase</button>`));
+  setContent(pageShell("Purchases", "Receive stock from suppliers and update inventory.", `<button class="button primary" data-add-purchase>Create Purchase</button><button class="button" data-export-purchases>Export CSV</button>`));
   const data = await api("/api/purchases");
-  setContent(pageShell("Purchases", "Receive stock from suppliers and update inventory.", `<button class="button primary" data-add-purchase>Create Purchase</button>`, table(
+  setContent(pageShell("Purchases", "Receive stock from suppliers and update inventory.", `<button class="button primary" data-add-purchase>Create Purchase</button><button class="button" data-export-purchases>Export CSV</button>`, table(
     [
       { label: "Purchase", value: (row) => `<strong>${escapeHtml(row.purchaseNumber)}</strong><br><small>${date(row.purchaseDate)}</small>` },
       { label: "Supplier", value: (row) => escapeHtml(row.supplier?.name || "") },
@@ -1503,6 +1643,7 @@ async function renderPurchases() {
     "No purchases yet. Create your first purchase to add raw materials or stock."
   )));
   document.querySelector("[data-add-purchase]").addEventListener("click", () => openPurchaseForm());
+  document.querySelector("[data-export-purchases]").addEventListener("click", () => window.open("/api/exports/purchases/csv", "_blank"));
   document.querySelectorAll("[data-receive-purchase]").forEach((button) => button.addEventListener("click", () => confirmAction("Receive this purchase and increase stock?", async () => api(`/api/purchases/${button.dataset.receivePurchase}/receive`, { method: "PATCH", body: {} }))));
 }
 
@@ -1537,16 +1678,17 @@ async function openPurchaseForm() {
 }
 
 async function renderInvoices() {
-  setContent(pageShell("Invoices", "Create invoices, issue stock, print documents, and record payments.", `<button class="button primary" data-add-invoice>Create Invoice</button>`));
+  setContent(pageShell("Invoices", "Create invoices, issue stock, print documents, and record payments.", `<button class="button primary" data-add-invoice>Create Invoice</button><button class="button" data-export-invoices>Export CSV</button>`));
   const data = await api("/api/invoices");
-  setContent(pageShell("Invoices", "Create invoices, issue stock, print documents, and record payments.", `<button class="button primary" data-add-invoice>Create Invoice</button>`, table(
+  setContent(pageShell("Invoices", "Create invoices, issue stock, print documents, and record payments.", `<button class="button primary" data-add-invoice>Create Invoice</button><button class="button" data-export-invoices>Export CSV</button>`, table(
     [
       { label: "Invoice", value: (row) => `<strong>${escapeHtml(row.invoiceNumber)}</strong><br><small>${date(row.invoiceDate)}</small>` },
       { label: "Customer", value: (row) => escapeHtml(row.customer?.name || "") },
       { label: "Total", value: (row) => money(row.totalAmount) },
       { label: "Paid", value: (row) => money(row.paidAmount) },
       { label: "Balance", value: (row) => money(row.balanceAmount) },
-      { label: "Status", value: (row) => badge(row.status) },
+      { label: "Invoice Status", value: (row) => badge(row.status) },
+      { label: "Payment Status", value: (row) => badge(row.paymentStatus) },
       { label: "Price Check", value: (row) => row.hasPriceChanges ? badge("prices changed") : "" },
       { label: "Actions", value: (row) => invoiceActions(row) }
     ],
@@ -1554,6 +1696,7 @@ async function renderInvoices() {
     "No invoices yet. Create your first invoice to start billing customers."
   )));
   document.querySelector("[data-add-invoice]").addEventListener("click", () => openInvoiceForm());
+  document.querySelector("[data-export-invoices]").addEventListener("click", () => window.open("/api/exports/invoices/csv", "_blank"));
   bindInvoiceActions(data.invoices);
 }
 
@@ -1563,8 +1706,7 @@ function invoiceActions(row) {
     ${row.status === "DRAFT" && row.hasPriceChanges ? `<button class="button" data-refresh-invoice="${row.id}">Update Draft Prices</button>` : ""}
     <button class="button" data-print-invoice="${row.id}">Print</button>
     <button class="button" data-pdf-invoice="${row.id}">Download PDF</button>
-    <button class="button" data-pay-invoice="${row.id}">Payment</button>
-    <button class="button" data-whatsapp-invoice="${row.id}">Share on WhatsApp</button>
+    ${numberValue(row.balanceAmount) > 0 ? `<button class="button" data-pay-invoice="${row.id}">Payment</button>` : ""}
   </div>`;
 }
 
@@ -1576,13 +1718,6 @@ function bindInvoiceActions(invoices) {
   document.querySelectorAll("[data-pay-invoice]").forEach((button) => button.addEventListener("click", () => {
     const invoice = invoices.find((item) => item.id === button.dataset.payInvoice);
     openPaymentForm({ customerId: invoice.customerId, invoiceId: invoice.id, amount: invoice.balanceAmount });
-  }));
-  document.querySelectorAll("[data-whatsapp-invoice]").forEach((button) => button.addEventListener("click", () => {
-    const invoice = invoices.find((item) => item.id === button.dataset.whatsappInvoice);
-    shareDocumentOnWhatsApp(
-      { entityType: "invoice", entityId: invoice.id },
-      (share) => `Hello, please find your ${state.settings.businessName || "DawnGas"} invoice below.\n\nInvoice No: ${invoice.invoiceNumber}\nCustomer: ${invoice.customer?.name || "Customer"}\nTotal: ${money(invoice.totalAmount)}\nBalance: ${money(invoice.balanceAmount)}\n\nDownload PDF:\n${share.pdfUrl}`
-    );
   }));
 }
 
@@ -1789,7 +1924,7 @@ async function renderPayments() {
       { label: "Invoice", value: (row) => escapeHtml(row.invoice?.invoiceNumber || row.order?.orderNumber || "") },
       { label: "Amount", value: (row) => `<span class="money">${money(row.amount)}</span>` },
       { label: "Method", value: (row) => badge(row.paymentMethod || row.method) },
-      { label: "Actions", value: (row) => `<button class="button" data-receipt="${row.id}">Receipt</button> <button class="button" data-pdf-receipt="${row.id}">Download PDF</button> <button class="button" data-whatsapp-receipt="${row.id}">Share on WhatsApp</button>` }
+      { label: "Actions", value: (row) => `<button class="button" data-receipt="${row.id}">Print</button> <button class="button" data-pdf-receipt="${row.id}">Download PDF</button>` }
     ],
     data.payments,
     "No payments recorded yet."
@@ -1798,15 +1933,6 @@ async function renderPayments() {
   document.querySelector("[data-export-payments]").addEventListener("click", () => window.open("/api/exports/payments/csv", "_blank"));
   document.querySelectorAll("[data-receipt]").forEach((button) => button.addEventListener("click", () => window.open(`/api/payments/${button.dataset.receipt}/receipt/print`, "_blank")));
   document.querySelectorAll("[data-pdf-receipt]").forEach((button) => button.addEventListener("click", () => window.open(`/api/payments/${button.dataset.pdfReceipt}/receipt/pdf`, "_blank")));
-  document.querySelectorAll("[data-whatsapp-receipt]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const payment = data.payments.find((item) => item.id === button.dataset.whatsappReceipt);
-      shareDocumentOnWhatsApp(
-        { entityType: "receipt", entityId: payment.id },
-        (share) => `Hello, please find your ${state.settings.businessName || "DawnGas"} payment receipt below.\n\nReceipt No: ${payment.receiptNumber}\nCustomer: ${payment.customer?.name || "Customer"}\nAmount Received: ${money(payment.amount)}\n\nDownload PDF:\n${share.pdfUrl}`
-      );
-    });
-  });
 }
 
 async function openPaymentForm(defaults = {}) {
@@ -1823,20 +1949,105 @@ async function openPaymentForm(defaults = {}) {
     ])
   ]);
   const orderOptions = [{ value: "", label: "No specific order" }, ...orders.orders.map((order) => ({ value: order.id, label: `${order.orderNumber} - ${order.customer?.name || ""}` }))];
-  const invoiceOptions = [{ value: "", label: "No specific invoice" }, ...invoices.invoices.map((invoice) => ({ value: invoice.id, label: `${invoice.invoiceNumber} - ${invoice.customer?.name || ""} - ${money(invoice.balanceAmount)}` }))];
+  const payableInvoices = invoices.invoices.filter((invoice) => numberValue(invoice.balanceAmount) > 0.001 || invoice.id === defaults.invoiceId);
+  const invoiceById = new Map(payableInvoices.map((invoice) => [invoice.id, invoice]));
+  const selectedInvoice = invoiceById.get(defaults.invoiceId);
+  const selectedCustomerId = selectedInvoice?.customerId || defaults.customerId || "";
+  const invoiceOptionsFor = (customerId, selectedId = "") => [
+    { value: "", label: "No specific invoice" },
+    ...payableInvoices
+      .filter((invoice) => !customerId || invoice.customerId === customerId || invoice.id === selectedId)
+      .map((invoice) => ({ value: invoice.id, label: `${invoice.invoiceNumber} - ${invoice.customer?.name || ""} - balance ${money(invoice.balanceAmount)}` }))
+  ];
   openModal(
-    "Record payment",
+    "Record Payment",
     `<div class="form-grid">
-      ${formSelect("customerId", "Customer", customers, defaults.customerId || "")}
-      ${formSelect("invoiceId", "Invoice optional", invoiceOptions, defaults.invoiceId || "")}
+      ${formSelect("customerId", "Customer", customers, selectedCustomerId)}
+      ${formSelect("invoiceId", "Invoice optional", invoiceOptionsFor(selectedCustomerId, defaults.invoiceId), defaults.invoiceId || "")}
       ${formSelect("orderId", "Order optional", orderOptions, defaults.orderId || "")}
-      ${formInput("amount", "Amount", defaults.amount || 0, "number", "step='0.01' required")}
+      <div class="payment-summary wide" data-invoice-payment-summary></div>
+      ${formInput("amount", "Payment Amount", selectedInvoice ? inputNumber(selectedInvoice.balanceAmount) : inputNumber(defaults.amount), "number", "step='0.01' min='0.01' required")}
+      <div class="field wide"><small class="validation-message" data-payment-validation></small></div>
       ${formSelect("paymentMethod", "Method", methods, "CASH")}
       ${formInput("paymentDate", "Payment date", today(), "date")}
       ${formTextarea("notes", "Notes", "")}
     </div>`,
-    async (form) => api("/api/payments", { method: "POST", body: formValues(form) })
+    async (form) => {
+      const values = formValues(form);
+      const amount = numberValue(values.amount);
+      const invoice = invoiceById.get(values.invoiceId);
+      if (amount <= 0) throw new Error("Payment amount must be greater than 0.");
+      if (invoice && amount > numberValue(invoice.balanceAmount) + 0.001) throw new Error(`Payment amount cannot exceed the invoice balance of ${money(invoice.balanceAmount)}.`);
+      if (invoice) values.customerId = invoice.customerId;
+      await api("/api/payments", { method: "POST", body: values });
+    }
   );
+
+  const customerSelect = modalRoot.querySelector("#customerId");
+  const invoiceSelect = modalRoot.querySelector("#invoiceId");
+  const amountInput = modalRoot.querySelector("#amount");
+  const summary = modalRoot.querySelector("[data-invoice-payment-summary]");
+  const validation = modalRoot.querySelector("[data-payment-validation]");
+  const submit = modalRoot.querySelector("button[type='submit']");
+
+  function renderInvoiceOptions() {
+    const selectedId = invoiceSelect.value;
+    const options = invoiceOptionsFor(customerSelect.value, selectedId);
+    invoiceSelect.innerHTML = options.map((option) => `<option value="${escapeHtml(option.value)}" ${String(option.value) === String(selectedId) ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("");
+    if (!options.some((option) => String(option.value) === String(selectedId))) invoiceSelect.value = "";
+  }
+
+  function selectedInvoiceData() {
+    return invoiceById.get(invoiceSelect.value);
+  }
+
+  function renderPaymentSummary(autofill = false) {
+    const invoice = selectedInvoiceData();
+    if (invoice) {
+      customerSelect.value = invoice.customerId;
+      if (autofill) amountInput.value = inputNumber(invoice.balanceAmount);
+      const amount = numberValue(amountInput.value);
+      const balanceAfter = Math.max(0, numberValue(invoice.balanceAmount) - amount);
+      summary.innerHTML = `
+        <div class="summary-title">Invoice Payment Summary</div>
+        <div class="summary-grid">
+          <div><span>Invoice Total</span><strong>${money(invoice.totalAmount)}</strong></div>
+          <div><span>Already Paid</span><strong>${money(invoice.paidAmount)}</strong></div>
+          <div><span>Balance Due</span><strong>${money(invoice.balanceAmount)}</strong></div>
+          <div><span>Balance After Payment</span><strong>${money(balanceAfter)}</strong></div>
+        </div>
+      `;
+      const invalid = amount <= 0 || amount > numberValue(invoice.balanceAmount) + 0.001;
+      validation.textContent = amount <= 0
+        ? "Amount must be greater than 0."
+        : amount > numberValue(invoice.balanceAmount) + 0.001
+          ? `Amount exceeds the invoice balance of ${money(invoice.balanceAmount)}.`
+          : "";
+      validation.classList.toggle("active", invalid);
+      submit.disabled = invalid;
+    } else {
+      summary.innerHTML = `<div class="summary-title">Invoice Payment Summary</div><p>Select an invoice to auto-fill the remaining balance and preview the balance after payment.</p>`;
+      const invalid = numberValue(amountInput.value) <= 0;
+      validation.textContent = invalid ? "Amount must be greater than 0." : "";
+      validation.classList.toggle("active", invalid);
+      submit.disabled = invalid;
+    }
+  }
+
+  customerSelect.addEventListener("change", () => {
+    const invoice = selectedInvoiceData();
+    if (invoice && customerSelect.value && invoice.customerId !== customerSelect.value) invoiceSelect.value = "";
+    renderInvoiceOptions();
+    renderPaymentSummary(false);
+  });
+  invoiceSelect.addEventListener("change", () => {
+    const invoice = selectedInvoiceData();
+    if (invoice) customerSelect.value = invoice.customerId;
+    renderInvoiceOptions();
+    renderPaymentSummary(true);
+  });
+  amountInput.addEventListener("input", () => renderPaymentSummary(false));
+  renderPaymentSummary(Boolean(selectedInvoice));
 }
 
 async function renderExpenses() {
@@ -1880,6 +2091,7 @@ async function openExpenseForm(expense = {}) {
       { value: "OTHER", label: "Other" }
     ])
   ]);
+  const hasReceipt = Boolean(expense.receiptFileId);
   openModal(
     expense.id ? "Edit expense" : "Add expense",
     `<div class="form-grid">
@@ -1889,9 +2101,21 @@ async function openExpenseForm(expense = {}) {
       ${formSelect("paymentMethod", "Payment Method", methods, expense.paymentMethod || expense.method || "CASH")}
       ${formInput("expenseDate", "Expense date", expense.expenseDate || today(), "date")}
       <div class="field wide">
-        <label for="receiptFile">Receipt attachment</label>
+        <label for="receiptFile">${hasReceipt ? "Replace receipt attachment" : "Receipt attachment"}</label>
+        ${hasReceipt ? `
+          <div class="attachment-control">
+            <div>
+              <strong>${escapeHtml(expense.receiptFileName || "Current receipt")}</strong>
+              <small>Existing attachment</small>
+            </div>
+            <div class="actions">
+              <a class="button" href="/api/uploads/${escapeHtml(expense.receiptFileId)}" target="_blank" rel="noopener">View</a>
+              <button class="button danger" type="button" data-remove-expense-attachment>Remove</button>
+            </div>
+          </div>
+        ` : ""}
         <input id="receiptFile" name="receiptFile" type="file" accept=".jpg,.jpeg,.png,.webp,.pdf">
-        <small>${expense.receiptFileId ? `<a href="/api/uploads/${escapeHtml(expense.receiptFileId)}" target="_blank">${escapeHtml(expense.receiptFileName || "Current receipt")}</a>` : "Optional receipt image or PDF."}</small>
+        <small>${hasReceipt ? "Choose a new file to replace the current receipt." : "Optional receipt image or PDF."}</small>
       </div>
       ${formTextarea("notes", "Notes", expense.notes || "")}
     </div>`,
@@ -1911,6 +2135,13 @@ async function openExpenseForm(expense = {}) {
       else await api("/api/expenses", { method: "POST", body: values });
     }
   );
+  if (hasReceipt && expense.id) {
+    modalRoot.querySelector("[data-remove-expense-attachment]")?.addEventListener("click", () => confirmAction(
+      "Remove this receipt attachment from the expense? The expense record will remain.",
+      async () => api(`/api/expenses/${expense.id}/attachment`, { method: "DELETE", body: {} }),
+      { title: "Remove attachment?", submitLabel: "Remove Attachment", danger: true }
+    ));
+  }
 }
 
 async function renderReports() {
@@ -1924,7 +2155,7 @@ async function renderReports() {
 function renderReportData(report, from, to) {
   const totals = report.totals;
   const max = Math.max(totals.sales, totals.paymentsCollected, totals.expenseTotal, totals.estimatedProfit, 1);
-  setContent(pageShell("Reports", "Inventory, production, purchases, invoices, payments, expenses, and profit reporting.", `<button class="button" data-run-report>Apply Filters</button><button class="button" data-print-report>Print</button><button class="button" data-export-report>Export CSV</button><button class="button" data-export-report-xlsx>Export Excel</button><button class="button" data-export-report-pdf>Download PDF</button><button class="button" data-share-report>Share on WhatsApp</button>`, `
+  setContent(pageShell("Reports", "Inventory, production, purchases, invoices, payments, expenses, and profit reporting.", `<button class="button" data-run-report>Apply Filters</button><button class="button" data-print-report>Print</button><button class="button" data-export-report>Export CSV</button><button class="button" data-export-report-xlsx>Export Excel</button><button class="button" data-export-report-pdf>Download PDF</button>`, `
     <div class="panel">
       <div class="filters">
         ${formInput("reportFrom", "From", from, "date")}
@@ -1957,14 +2188,6 @@ function renderReportData(report, from, to) {
   document.querySelector("[data-export-report]").addEventListener("click", () => window.open(`/api/reports/summary/csv?from=${document.querySelector("#reportFrom").value}&to=${document.querySelector("#reportTo").value}`, "_blank"));
   document.querySelector("[data-export-report-xlsx]").addEventListener("click", () => window.open(`/api/reports/summary/xlsx?from=${document.querySelector("#reportFrom").value}&to=${document.querySelector("#reportTo").value}`, "_blank"));
   document.querySelector("[data-export-report-pdf]").addEventListener("click", () => window.open(`/api/reports/summary/pdf?from=${document.querySelector("#reportFrom").value}&to=${document.querySelector("#reportTo").value}`, "_blank"));
-  document.querySelector("[data-share-report]").addEventListener("click", () => {
-    const reportFrom = document.querySelector("#reportFrom").value;
-    const reportTo = document.querySelector("#reportTo").value;
-    shareDocumentOnWhatsApp(
-      { entityType: "report", reportType: "summary", from: reportFrom, to: reportTo },
-      (share) => `Hello, please find the requested ${state.settings.businessName || "DawnGas"} report below.\n\nReport: Business Report\nPeriod: ${reportFrom} - ${reportTo}\n\nDownload PDF:\n${share.pdfUrl}`
-    );
-  });
   document.querySelectorAll("[data-named-report]").forEach((button) => button.addEventListener("click", () => window.open(`/api/reports/export/pdf?type=${button.dataset.namedReport}&from=${document.querySelector("#reportFrom").value}&to=${document.querySelector("#reportTo").value}`, "_blank")));
 }
 
@@ -2599,7 +2822,7 @@ async function renderRecycle() {
       { label: "Type", value: "type" },
       { label: "Record", value: (row) => escapeHtml(row.record.name || row.record.title || row.record.orderNumber || row.record.deliveryNumber || row.record.fileName || row.record.id) },
       { label: "Archived", value: (row) => date(row.record.archivedAt || row.record.deletedAt) },
-      { label: "Actions", value: (row) => `<button class="button" data-restore-type="${row.type}" data-restore-id="${row.record.id}">Restore</button>${["notes", "attachments"].includes(row.type) ? ` <button class="button danger" data-delete-type="${row.type}" data-delete-id="${row.record.id}">Permanent Delete</button>` : ""}` }
+      { label: "Actions", value: (row) => `<div class="actions"><button class="button" data-restore-type="${row.type}" data-restore-id="${row.record.id}">Restore</button><button class="button danger" data-delete-type="${row.type}" data-delete-id="${row.record.id}">Delete Permanently</button></div>` }
     ],
     data.items,
     "Recycle bin is empty."
@@ -2608,7 +2831,7 @@ async function renderRecycle() {
     await api(`/api/recycle-bin/${button.dataset.restoreType}/${button.dataset.restoreId}/restore`, { method: "POST", body: {} });
     await renderRecycle();
   }));
-  document.querySelectorAll("[data-delete-type]").forEach((button) => button.addEventListener("click", () => confirmAction("Permanently delete this non-financial record?", async () => api(`/api/recycle-bin/${button.dataset.deleteType}/${button.dataset.deleteId}`, { method: "DELETE", body: {} }))));
+  document.querySelectorAll("[data-delete-type]").forEach((button) => button.addEventListener("click", () => confirmPermanentDelete(button.dataset.deleteType, button.dataset.deleteId)));
 }
 
 async function renderActivity() {

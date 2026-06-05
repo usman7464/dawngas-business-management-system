@@ -1176,6 +1176,62 @@ function categoryName(db, categoryId) {
   return (findCategory(db, categoryId) || {}).name || "";
 }
 
+function findMasterDataRecord(db, type, value) {
+  const resolvedType = normalizeMasterDataType(type);
+  const needle = cleanString(value);
+  if (!resolvedType || !needle) return null;
+  ensureDefaultMasterData(db);
+  const lowered = needle.toLowerCase();
+  return (db.masterData || []).find((item) => {
+    if (item.type !== resolvedType) return false;
+    return [item.id, item.value, item.label, item.code].some((candidate) => cleanString(candidate).toLowerCase() === lowered);
+  }) || null;
+}
+
+function normalizeStorageLocationRef(db, value, existing = {}) {
+  const raw = cleanString(value);
+  const fallback = raw || cleanString(existing.storageLocationId || existing.storageLocation || existing.storageLocationSnapshotName);
+  const record = findMasterDataRecord(db, "storageLocations", fallback);
+  if (record) {
+    return {
+      id: record.id,
+      value: record.value,
+      label: record.label || record.value
+    };
+  }
+  return {
+    id: "",
+    value: fallback,
+    label: fallback
+  };
+}
+
+function applyInventoryLocation(item, db, value, existing = item) {
+  const location = normalizeStorageLocationRef(db, value, existing);
+  item.storageLocationId = location.id;
+  item.storageLocation = location.value;
+  item.storageLocationSnapshotName = location.label;
+  return item;
+}
+
+function storageLocationLabel(db, item = {}) {
+  const record = findMasterDataRecord(db, "storageLocations", item.storageLocationId || item.storageLocation || item.storageLocationSnapshotName);
+  return (record && (record.label || record.value)) || cleanString(item.storageLocationSnapshotName || item.storageLocation);
+}
+
+function inventoryMatchesStorageLocation(db, item, value) {
+  const queryValue = cleanString(value);
+  if (!queryValue) return true;
+  const selected = normalizeStorageLocationRef(db, queryValue);
+  const needles = [queryValue, selected.id, selected.value, selected.label]
+    .map((entry) => cleanString(entry).toLowerCase())
+    .filter(Boolean);
+  const haystack = [item.storageLocationId, item.storageLocation, item.storageLocationSnapshotName, storageLocationLabel(db, item)]
+    .map((entry) => cleanString(entry).toLowerCase())
+    .filter(Boolean);
+  return needles.some((needle) => haystack.includes(needle));
+}
+
 function isTrackableProduct(product) {
   return product && normalizeItemType(product.itemType) !== ITEM_TYPES.SERVICE && product.trackInventory !== false;
 }
@@ -1193,7 +1249,9 @@ function syncInventoryAliases(item) {
   item.availableStock = Math.max(0, item.currentStock - item.reservedStock);
   item.lowStockThreshold = cleanNumber(item.lowStockThreshold);
   item.reorderQuantity = cleanNumber(item.reorderQuantity ?? item.suggestedRestockQuantity);
+  item.storageLocationId = cleanString(item.storageLocationId);
   item.storageLocation = cleanString(item.storageLocation);
+  item.storageLocationSnapshotName = cleanString(item.storageLocationSnapshotName || item.storageLocation);
   item.status = stockStatus(item);
 
   // Compatibility fields for older records and exports while the UI uses general inventory language.
@@ -1260,6 +1318,12 @@ function formatMoney(db, value) {
   return `${code} ${Number(value || 0).toLocaleString("en-PK", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function formatQuantity(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "0";
+  return Number.isInteger(number) ? String(number) : number.toLocaleString("en-PK", { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
 function customerBalance(db, customerId) {
   const customer = findCustomer(db, customerId);
   const opening = cleanNumber(customer && customer.openingBalance);
@@ -1323,6 +1387,7 @@ function ensureInventoryForProduct(db, product, defaults = {}) {
   if (!isTrackableProduct(product)) return null;
   let item = db.inventory.find((entry) => entry.productId === product.id && isActive(entry));
   if (!item) {
+    const location = normalizeStorageLocationRef(db, defaults.storageLocation ?? defaults.storageLocationId ?? defaults.storageLocationSnapshotName);
     item = {
       id: id("inv"),
       productId: product.id,
@@ -1331,7 +1396,9 @@ function ensureInventoryForProduct(db, product, defaults = {}) {
       availableStock: cleanNumber(defaults.currentStock),
       lowStockThreshold: cleanNumber(defaults.lowStockThreshold ?? db.businessSettings.lowStockThreshold ?? 5),
       reorderQuantity: cleanNumber(defaults.reorderQuantity),
-      storageLocation: cleanString(defaults.storageLocation),
+      storageLocationId: location.id,
+      storageLocation: location.value,
+      storageLocationSnapshotName: location.label,
       lastMovementAt: "",
       status: "IN_STOCK",
       notes: cleanString(defaults.notes),
@@ -1341,6 +1408,25 @@ function ensureInventoryForProduct(db, product, defaults = {}) {
       deletedAt: null
     };
     db.inventory.unshift(item);
+  } else {
+    let changed = false;
+    if (defaults.lowStockThreshold !== undefined) {
+      item.lowStockThreshold = cleanNumber(defaults.lowStockThreshold);
+      changed = true;
+    }
+    if (defaults.reorderQuantity !== undefined) {
+      item.reorderQuantity = cleanNumber(defaults.reorderQuantity);
+      changed = true;
+    }
+    if (defaults.notes !== undefined) {
+      item.notes = cleanString(defaults.notes);
+      changed = true;
+    }
+    if (defaults.storageLocation !== undefined || defaults.storageLocationId !== undefined || defaults.storageLocationSnapshotName !== undefined) {
+      applyInventoryLocation(item, db, defaults.storageLocation ?? defaults.storageLocationId ?? defaults.storageLocationSnapshotName, item);
+      changed = true;
+    }
+    if (changed) item.updatedAt = nowIso();
   }
   return syncInventoryAliases(item);
 }
@@ -1469,7 +1555,7 @@ function reportForRange(db, from, to) {
     totals: {
       orders: orders.length,
       invoices: invoices.length,
-      unpaidInvoices: activeInvoices(db).filter((invoice) => !["PAID", "CANCELLED"].includes(invoice.status)).length,
+      unpaidInvoices: activeInvoices(db).filter((invoice) => refreshInvoicePaymentStatus(db, invoice).paymentStatus !== "PAID").length,
       deliveries: deliveries.length,
       pendingDeliveries: deliveries.filter((item) => item.status !== "completed").length,
       payments: payments.length,
@@ -1515,6 +1601,69 @@ function toCsv(rows, headers) {
     lines.push(headers.map((header) => csvEscape(typeof header.value === "function" ? header.value(row) : row[header.value])).join(","));
   }
   return lines.join("\n");
+}
+
+function csvDate(value) {
+  return value ? String(value).slice(0, 10) : "";
+}
+
+function csvNumber(value) {
+  return Number(value || 0).toFixed(2);
+}
+
+function humanizeKey(value) {
+  const text = cleanString(value);
+  const known = {
+    unpaidInvoices: "Unpaid Invoices",
+    pendingDeliveries: "Pending Deliveries",
+    productionBatches: "Production Batches",
+    inventoryMovements: "Inventory Movements",
+    paymentsCollected: "Payments Collected",
+    expenseTotal: "Expense Total",
+    purchaseTotal: "Purchase Total",
+    estimatedProfit: "Estimated Profit",
+    outstandingBalance: "Outstanding Balance",
+    inventoryValue: "Inventory Value"
+  };
+  return known[text] || text.replace(/([A-Z])/g, " $1").replace(/[-_]+/g, " ").replace(/^./, (letter) => letter.toUpperCase());
+}
+
+function titleCaseEnum(value) {
+  return cleanString(value)
+    .replace(/[_-]+/g, " ")
+    .toLowerCase()
+    .replace(/\b[a-z]/g, (letter) => letter.toUpperCase());
+}
+
+const REPORT_MONEY_METRICS = new Set(["sales", "paymentsCollected", "expenseTotal", "purchaseTotal", "estimatedProfit", "outstandingBalance", "inventoryValue"]);
+
+function formatReportMetricValue(db, key, value) {
+  if (typeof value !== "number") return cleanString(value);
+  if (REPORT_MONEY_METRICS.has(key)) return formatMoney(db, value);
+  return Number(value || 0).toLocaleString("en-PK", { maximumFractionDigits: 0 });
+}
+
+function formatReportCell(db, key, value) {
+  if (cleanString(key) === "metric") return humanizeKey(value);
+  if (typeof value !== "number") return cleanString(value);
+  if (/amount|balance|cost|price|profit|sales|total|value|paid/i.test(cleanString(key))) return formatMoney(db, value);
+  return formatQuantity(value);
+}
+
+function businessCsv(db, title, rows, headers, options = {}) {
+  const metadata = [
+    [title],
+    ["Business", getBranding(db).businessName || "DawnGas"],
+    ["Generated Date", todayDate()]
+  ];
+  if (options.dateRange) metadata.push(["Date Range", options.dateRange]);
+  if (options.filters) metadata.push(["Applied Filters", options.filters]);
+  metadata.push([]);
+  const body = toCsv(rows, headers);
+  const totals = options.totals && options.totals.length
+    ? ["", ...options.totals.map((row) => row.map(csvEscape).join(","))].join("\n")
+    : "";
+  return `${metadata.map((row) => row.map(csvEscape).join(",")).join("\n")}${body ? `\n${body}` : ""}${totals ? `\n${totals}` : ""}`;
 }
 
 function reportRowsAndHeaders(report) {
@@ -1709,23 +1858,39 @@ function printableHtml(db, title, body) {
   <meta charset="utf-8">
   <title>${escapeHtml(title)}</title>
   <style>
-    body{font-family:Arial,sans-serif;color:#172033;margin:32px}
-    header{border-bottom:3px solid ${settings.primaryColor};padding-bottom:16px;margin-bottom:24px}
-    h1{margin:0;color:${settings.primaryColor};font-size:28px}
-    h2{margin:16px 0 8px}
-    table{width:100%;border-collapse:collapse;margin:16px 0}
-    th,td{border:1px solid #d7dee8;padding:8px;text-align:left;font-size:13px}
-    th{background:#f2f5f8}
-    .muted{color:#64748b}
-    .total{font-weight:700}
-    footer{margin-top:32px;border-top:1px solid #d7dee8;padding-top:12px;color:#64748b;font-size:12px}
+    @page{size:A4;margin:14mm}
+    *{box-sizing:border-box}
+    body{font-family:Arial,sans-serif;color:#172033;margin:0;background:#fff;font-size:13px;line-height:1.45}
+    header{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;border-bottom:4px solid ${settings.primaryColor};padding-bottom:16px;margin-bottom:22px}
+    h1{margin:0;color:${settings.primaryColor};font-size:26px;line-height:1.1}
+    h2{margin:0;color:#172033;font-size:24px}
+    h3{margin:0 0 8px;font-size:14px;color:#172033;text-transform:uppercase;letter-spacing:.04em}
+    table{width:100%;border-collapse:collapse;margin:14px 0}
+    th,td{border:1px solid #d7dee8;padding:9px 10px;text-align:left;font-size:12.5px;vertical-align:top}
+    th{background:#f2f6f8;color:#344054;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+    .brand-contact{color:#64748b;text-align:right;max-width:320px}
+    .accent-line{height:4px;background:${settings.primaryColor};margin:16px 0;border-radius:99px}
+    .doc-title-row{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:16px}
+    .doc-meta{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;min-width:260px}
+    .meta-item,.doc-box{border:1px solid #d7dee8;border-radius:8px;padding:10px;background:#fbfcfd}
+    .meta-item span,.muted{color:#64748b}
+    .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0}
+    .totals{margin-left:auto;width:min(310px,100%);border:1px solid #d7dee8;border-radius:8px;overflow:hidden}
+    .total-row{display:flex;justify-content:space-between;gap:16px;padding:8px 10px;border-bottom:1px solid #d7dee8}
+    .total-row:last-child{border-bottom:0}
+    .total-row.grand{background:#f2f6f8;color:#172033;font-weight:700;font-size:15px}
+    .amount-highlight{border:1px solid ${settings.primaryColor};background:#f0faf8;color:${settings.primaryColor};border-radius:10px;padding:14px;margin:14px 0;font-size:20px;font-weight:800;text-align:center}
+    .print-guidance{margin:0 0 18px;padding:10px 12px;border:1px solid #bfdbfe;background:#eff6ff;color:#1e3a8a;border-radius:8px;font-size:12px}
+    footer{margin-top:28px;border-top:1px solid #d7dee8;padding-top:12px;color:#64748b;font-size:11px}
+    @media print{button,.no-print{display:none!important}body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
   </style>
 </head>
 <body>
   <header>
-    ${logoMarkup(settings, 80)}
-    <div class="muted">${escapeHtml([settings.address, settings.phone, settings.email].filter(Boolean).join(" | "))}</div>
+    <div>${logoMarkup(settings, 80)}<h1>${escapeHtml(settings.businessName || "DawnGas")}</h1></div>
+    <div class="brand-contact">${escapeHtml([settings.address, settings.phone, settings.email].filter(Boolean).join(" | "))}</div>
   </header>
+  <div class="print-guidance no-print">For official sharing and saving, use Download PDF. If your browser print dialog adds URL/date margins, disable Headers and Footers in the print dialog.</div>
   ${body}
   ${settings.signatureFileId || settings.signatureAttachmentId ? `<div style="margin-top:24px"><img src="/api/uploads/${escapeHtml(settings.signatureFileId || settings.signatureAttachmentId)}" alt="Signature" style="max-height:70px;max-width:220px;object-fit:contain"><div class="muted">Authorized signature</div></div>` : ""}
   <footer>${escapeHtml(settings.invoiceFooterNote || settings.reportFooterNote || "Generated by DawnGas.")}</footer>
@@ -1891,6 +2056,7 @@ function invoicePdfDocument(db, invoiceId) {
   if (!invoice) return null;
   refreshInvoicePaymentStatus(db, invoice);
   const customer = findCustomer(db, invoice.customerId) || {};
+  const settings = getBranding(db);
   return {
     entityType: "invoice",
     entityId: invoice.id,
@@ -1899,19 +2065,36 @@ function invoicePdfDocument(db, invoiceId) {
     title: `Invoice ${invoice.invoiceNumber}`,
     fileName: `${invoice.invoiceNumber}.pdf`,
     lines: [
+      "Invoice Details",
+      `Invoice Number: ${invoice.invoiceNumber}`,
+      `Invoice Status: ${invoice.status}`,
+      `Payment Status: ${invoice.paymentStatus}`,
+      `Invoice Date: ${invoice.invoiceDate}`,
+      `Due Date: ${invoice.dueDate || "N/A"}`,
+      "",
+      "Bill To",
       `Customer: ${customer.name || ""}`,
       `Phone: ${customer.phone || ""}`,
-      `Date: ${invoice.invoiceDate}`,
-      `Due: ${invoice.dueDate || ""}`,
+      `Email: ${customer.email || ""}`,
+      `Address: ${customer.address || ""}`,
       "",
-      ...(invoice.items || []).map((item) => `${item.itemName} | ${item.quantity} x ${formatMoney(db, item.unitPrice)} = ${formatMoney(db, item.lineTotal)}`),
+      "Items",
+      "Item | Description | Quantity | Unit | Unit Price | Line Total",
+      ...(invoice.items || []).map((item) => `${item.itemName} | ${item.description || ""} | ${formatQuantity(item.quantity)} | ${item.unitOfMeasure || ""} | ${formatMoney(db, item.unitPrice)} | ${formatMoney(db, item.lineTotal)}`),
       "",
+      "Totals",
       `Subtotal: ${formatMoney(db, invoice.subtotal)}`,
       `Discount: ${formatMoney(db, invoice.discount)}`,
       `Tax: ${formatMoney(db, invoice.tax)}`,
       `Total: ${formatMoney(db, invoice.totalAmount)}`,
       `Paid: ${formatMoney(db, invoice.paidAmount)}`,
-      `Balance: ${formatMoney(db, invoice.balanceAmount)}`
+      `Balance: ${formatMoney(db, invoice.balanceAmount)}`,
+      "",
+      "Payment Instructions",
+      settings.paymentInstructions || "Please pay the outstanding balance using the agreed payment method.",
+      "",
+      "Terms",
+      invoice.terms || settings.invoiceTerms || settings.terms || ""
     ],
     totalAmount: cleanNumber(invoice.totalAmount),
     balanceAmount: cleanNumber(invoice.balanceAmount)
@@ -1922,6 +2105,8 @@ function receiptPdfDocument(db, paymentId) {
   const payment = db.payments.find((item) => item.id === paymentId && isActive(item));
   if (!payment) return null;
   const customer = findCustomer(db, payment.customerId) || {};
+  const invoice = db.invoices.find((item) => item.id === payment.invoiceId);
+  if (invoice) refreshInvoicePaymentStatus(db, invoice);
   return {
     entityType: "receipt",
     entityId: payment.id,
@@ -1930,15 +2115,25 @@ function receiptPdfDocument(db, paymentId) {
     title: `Receipt ${payment.receiptNumber}`,
     fileName: `${payment.receiptNumber}.pdf`,
     lines: [
+      "Receipt Details",
+      `Receipt Number: ${payment.receiptNumber}`,
+      `Payment Date: ${payment.paymentDate}`,
+      `Payment Method: ${titleCaseEnum(payment.paymentMethod || payment.method)}`,
+      `Linked Invoice: ${invoice ? invoice.invoiceNumber : "N/A"}`,
+      "",
+      "Customer",
       `Customer: ${customer.name || ""}`,
       `Phone: ${customer.phone || ""}`,
-      `Date: ${payment.paymentDate}`,
-      `Payment Method: ${payment.paymentMethod || payment.method}`,
+      `Address: ${customer.address || ""}`,
+      "",
+      "Payment Summary",
       `Previous Balance: ${formatMoney(db, payment.previousBalance)}`,
       `Amount Received: ${formatMoney(db, payment.amount)}`,
-      `Remaining Balance: ${formatMoney(db, customerBalance(db, payment.customerId))}`,
+      `Remaining Customer Balance: ${formatMoney(db, customerBalance(db, payment.customerId))}`,
+      invoice ? `Invoice Balance Before Payment: ${formatMoney(db, payment.invoicePreviousBalance ?? invoice.totalAmount)}` : "",
+      invoice ? `Invoice Balance After Payment: ${formatMoney(db, payment.invoiceRemainingBalance ?? invoice.balanceAmount)}` : "",
       `Notes: ${payment.notes || ""}`
-    ],
+    ].filter((line) => line !== ""),
     totalAmount: cleanNumber(payment.amount),
     balanceAmount: cleanNumber(customerBalance(db, payment.customerId))
   };
@@ -1992,15 +2187,16 @@ function reportPdfDocument(db, reportType = "summary", from = "", to = "") {
       lines: [
         `Date Range: ${report.from} to ${report.to}`,
         "",
-        ...Object.entries(report.totals).map(([metric, value]) => `${metric}: ${typeof value === "number" ? formatMoney(db, value) : value}`)
+        "Business Summary",
+        ...Object.entries(report.totals).map(([metric, value]) => `${humanizeKey(metric)}: ${formatReportMetricValue(db, metric, value)}`)
       ]
     };
   }
   const report = buildNamedReport(db, safeType, { from: reportFrom, to: reportTo });
   const { rows, headers } = reportRowsAndHeaders(report);
-  const lines = [`Date Range: ${report.from} to ${report.to}`, "", headers.join(" | ")];
+  const lines = [`Date Range: ${report.from} to ${report.to}`, "", headers.map(humanizeKey).join(" | ")];
   for (const row of rows.slice(0, 45)) {
-    lines.push(headers.map((header) => row[header] ?? "").join(" | "));
+    lines.push(headers.map((header) => formatReportCell(db, header === "value" && row.metric ? row.metric : header, row[header])).join(" | "));
   }
   if (rows.length > 45) lines.push(`... ${rows.length - 45} more rows in CSV/XLSX export`);
   return {
@@ -2273,7 +2469,7 @@ route("GET", "/api/dashboard/summary", async ({ db, res }) => {
       rawMaterialsLowStock: rawMaterialsLowStock.length,
       finishedProductsStock,
       invoicesToday: todayReport.totals.invoices,
-      unpaidInvoices: activeInvoices(db).filter((invoice) => !["PAID", "CANCELLED"].includes(refreshInvoicePaymentStatus(db, invoice).status)).length,
+      unpaidInvoices: activeInvoices(db).filter((invoice) => refreshInvoicePaymentStatus(db, invoice).paymentStatus !== "PAID").length,
       purchasesThisMonth: monthReport.totals.purchaseTotal,
       pendingDeliveries: db.deliveries.filter((item) => isActive(item) && item.status !== "completed").length,
       completedDeliveriesToday: db.deliveries.filter((item) => isActive(item) && item.status === "completed" && String(item.completedDate || "").slice(0, 10) === today).length,
@@ -2584,12 +2780,15 @@ function enrichInventory(db, item) {
   const synced = syncInventoryAliases({ ...item });
   const product = findProduct(db, item.productId) || null;
   const category = product ? findCategory(db, product.categoryId) || null : null;
+  const locationName = storageLocationLabel(db, synced);
   return {
     ...synced,
     product,
     category,
     itemType: product ? normalizeItemType(product.itemType) : "",
-    categoryName: category ? category.name : ""
+    categoryName: category ? category.name : "",
+    storageLocationName: locationName,
+    displayStorageLocation: locationName
   };
 }
 
@@ -3089,12 +3288,12 @@ route("GET", "/api/inventory", async ({ db, query, res }) => {
   let inventory = db.inventory.filter(isActive).map((item) => enrichInventory(db, item));
   if (query.itemType) inventory = inventory.filter((item) => normalizeItemType(item.itemType) === normalizeItemType(query.itemType));
   if (query.categoryId) inventory = inventory.filter((item) => item.product && item.product.categoryId === query.categoryId);
-  if (query.storageLocation) inventory = inventory.filter((item) => cleanString(item.storageLocation).toLowerCase().includes(cleanString(query.storageLocation).toLowerCase()));
+  if (query.storageLocation) inventory = inventory.filter((item) => inventoryMatchesStorageLocation(db, item, query.storageLocation));
   if (query.status) inventory = inventory.filter((item) => item.status === cleanString(query.status).toUpperCase());
   if (query.lowStock === "true") inventory = inventory.filter((item) => item.status === "LOW_STOCK" || item.status === "OUT_OF_STOCK");
   if (query.search) {
     const term = cleanString(query.search).toLowerCase();
-    inventory = inventory.filter((item) => [item.product?.name, item.product?.sku, item.storageLocation].some((value) => cleanString(value).toLowerCase().includes(term)));
+    inventory = inventory.filter((item) => [item.product?.name, item.product?.sku, item.storageLocation, item.storageLocationSnapshotName, item.storageLocationName].some((value) => cleanString(value).toLowerCase().includes(term)));
   }
   sendJson(res, 200, { success: true, inventory });
 });
@@ -3140,10 +3339,12 @@ route("PATCH", "/api/inventory/:id", async ({ db, params, body, res }) => {
   Object.assign(item, {
     lowStockThreshold: cleanNumber(body.lowStockThreshold ?? item.lowStockThreshold),
     reorderQuantity: cleanNumber(body.reorderQuantity ?? item.reorderQuantity),
-    storageLocation: cleanString(body.storageLocation ?? item.storageLocation),
     notes: cleanString(body.notes ?? item.notes),
     updatedAt: nowIso()
   });
+  if (body.storageLocation !== undefined || body.storageLocationId !== undefined) {
+    applyInventoryLocation(item, db, body.storageLocation ?? body.storageLocationId, item);
+  }
   syncInventoryAliases(item);
   addActivity(db, "inventory_updated", "inventory", item.id, "Inventory settings updated.");
   checkLowStock(db, item);
@@ -3167,7 +3368,7 @@ route("PATCH", "/api/inventory/:id/threshold", async ({ db, params, body, res })
 route("PATCH", "/api/inventory/:id/location", async ({ db, params, body, res }) => {
   const item = db.inventory.find((entry) => entry.id === params.id);
   if (!item) return sendError(res, 404, "Inventory record not found.");
-  item.storageLocation = cleanString(body.storageLocation);
+  applyInventoryLocation(item, db, body.storageLocation ?? body.storageLocationId, item);
   item.updatedAt = nowIso();
   addActivity(db, "inventory_location_updated", "inventory", item.id, "Inventory location updated.");
   await saveDb(db);
@@ -3603,6 +3804,14 @@ function invoicePriceChanges(db, invoice) {
     .filter(Boolean);
 }
 
+function invoicePaymentStatus(totalAmount, paidAmount) {
+  const total = cleanNumber(totalAmount);
+  const paid = cleanNumber(paidAmount);
+  if (paid <= 0) return "UNPAID";
+  if (paid + 0.001 < total) return "PARTIAL";
+  return "PAID";
+}
+
 function recalculateInvoiceTotals(invoice) {
   invoice.items = (invoice.items || []).map((item) => ({
     ...item,
@@ -3613,6 +3822,7 @@ function recalculateInvoiceTotals(invoice) {
   invoice.subtotal = invoice.items.reduce((sum, item) => sum + cleanNumber(item.lineTotal), 0);
   invoice.totalAmount = Math.max(0, cleanNumber(invoice.subtotal) - cleanNumber(invoice.discount) + cleanNumber(invoice.tax));
   invoice.balanceAmount = Math.max(0, cleanNumber(invoice.totalAmount) - cleanNumber(invoice.paidAmount));
+  invoice.paymentStatus = invoicePaymentStatus(invoice.totalAmount, invoice.paidAmount);
   invoice.updatedAt = nowIso();
   return invoice;
 }
@@ -3657,10 +3867,9 @@ function refreshInvoicePaymentStatus(db, invoice) {
   invoice.paidAmount = paidAmount;
   invoice.totalAmount = invoiceTotal(invoice);
   invoice.balanceAmount = Math.max(0, invoice.totalAmount - invoice.paidAmount);
+  invoice.paymentStatus = invoicePaymentStatus(invoice.totalAmount, invoice.paidAmount);
   if (invoice.status !== "DRAFT" && invoice.status !== "CANCELLED") {
-    if (invoice.balanceAmount <= 0) invoice.status = "PAID";
-    else if (invoice.paidAmount > 0) invoice.status = "PARTIAL";
-    else if (invoice.dueDate && invoice.dueDate < todayDate()) invoice.status = "OVERDUE";
+    if (invoice.dueDate && invoice.dueDate < todayDate() && invoice.balanceAmount > 0) invoice.status = "OVERDUE";
     else invoice.status = "ISSUED";
   }
   invoice.updatedAt = nowIso();
@@ -3728,6 +3937,7 @@ route("POST", "/api/invoices", async ({ db, body, res }) => {
     totalAmount,
     paidAmount: 0,
     balanceAmount: totalAmount,
+    paymentStatus: "UNPAID",
     notes: cleanString(body.notes),
     terms: cleanString(body.terms) || getBranding(db).invoiceTerms || getBranding(db).terms || "",
     createdAt: nowIso(),
@@ -3811,17 +4021,38 @@ function invoicePrintBody(db, invoice) {
   const rows = (invoice.items || [])
     .map(
       (item) =>
-        `<tr><td>${escapeHtml(item.itemName)}</td><td>${escapeHtml(item.description)}</td><td>${currency(item.quantity)}</td><td>${formatMoney(db, item.unitPrice)}</td><td>${formatMoney(db, item.lineTotal)}</td></tr>`
+        `<tr><td><strong>${escapeHtml(item.itemName)}</strong></td><td>${escapeHtml(item.description)}</td><td>${formatQuantity(item.quantity)}</td><td>${escapeHtml(item.unitOfMeasure || "")}</td><td>${formatMoney(db, item.unitPrice)}</td><td>${formatMoney(db, item.lineTotal)}</td></tr>`
     )
     .join("");
+  const settings = getBranding(db);
   return `
-    <h2>Invoice ${escapeHtml(invoice.invoiceNumber)}</h2>
-    <div class="muted">Date: ${escapeHtml(invoice.invoiceDate)}${invoice.dueDate ? ` | Due: ${escapeHtml(invoice.dueDate)}` : ""}</div>
-    <p><strong>Bill To</strong><br>${escapeHtml(customer.name || "")}<br>${escapeHtml(customer.phone || "")}<br>${escapeHtml(customer.address || "")}</p>
-    <table><thead><tr><th>Item</th><th>Description</th><th>Qty</th><th>Unit Price</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table>
-    <p>Subtotal: ${formatMoney(db, invoice.subtotal)}<br>Discount: ${formatMoney(db, invoice.discount)}<br>Tax: ${formatMoney(db, invoice.tax)}</p>
-    <p class="total">Total: ${formatMoney(db, invoice.totalAmount)}<br>Paid: ${formatMoney(db, invoice.paidAmount)}<br>Balance: ${formatMoney(db, invoice.balanceAmount)}</p>
-    <p class="muted">${escapeHtml(invoice.terms || getBranding(db).invoiceTerms || "")}</p>
+    <section class="doc-title-row">
+      <div>
+        <h2>Invoice</h2>
+        <div class="muted">${escapeHtml(invoice.invoiceNumber)}</div>
+      </div>
+      <div class="doc-meta">
+        <div class="meta-item"><span>Invoice Date</span><br><strong>${escapeHtml(invoice.invoiceDate)}</strong></div>
+        <div class="meta-item"><span>Due Date</span><br><strong>${escapeHtml(invoice.dueDate || "N/A")}</strong></div>
+        <div class="meta-item"><span>Invoice Status</span><br><strong>${escapeHtml(invoice.status)}</strong></div>
+        <div class="meta-item"><span>Payment Status</span><br><strong>${escapeHtml(invoice.paymentStatus || invoicePaymentStatus(invoice.totalAmount, invoice.paidAmount))}</strong></div>
+        <div class="meta-item"><span>Balance</span><br><strong>${formatMoney(db, invoice.balanceAmount)}</strong></div>
+      </div>
+    </section>
+    <section class="info-grid">
+      <div class="doc-box"><h3>Bill To</h3><strong>${escapeHtml(customer.name || "")}</strong><br>${escapeHtml(customer.phone || "")}<br>${escapeHtml(customer.email || "")}<br>${escapeHtml(customer.address || "")}</div>
+      <div class="doc-box"><h3>Payment Instructions</h3>${escapeHtml(settings.paymentInstructions || "Please pay the outstanding balance by the due date.")}</div>
+    </section>
+    <table><thead><tr><th>Item</th><th>Description</th><th>Quantity</th><th>Unit</th><th>Unit Price</th><th>Line Total</th></tr></thead><tbody>${rows}</tbody></table>
+    <section class="totals">
+      <div class="total-row"><span>Subtotal</span><strong>${formatMoney(db, invoice.subtotal)}</strong></div>
+      <div class="total-row"><span>Discount</span><strong>${formatMoney(db, invoice.discount)}</strong></div>
+      <div class="total-row"><span>Tax</span><strong>${formatMoney(db, invoice.tax)}</strong></div>
+      <div class="total-row grand"><span>Total</span><strong>${formatMoney(db, invoice.totalAmount)}</strong></div>
+      <div class="total-row"><span>Paid</span><strong>${formatMoney(db, invoice.paidAmount)}</strong></div>
+      <div class="total-row"><span>Balance</span><strong>${formatMoney(db, invoice.balanceAmount)}</strong></div>
+    </section>
+    <p class="muted">${escapeHtml(invoice.terms || settings.invoiceTerms || "")}</p>
   `;
 }
 
@@ -3833,26 +4064,9 @@ route("GET", "/api/invoices/:id/print", async ({ db, params, res }) => {
 });
 
 route("GET", "/api/invoices/:id/pdf", async ({ db, params, res }) => {
-  const invoice = db.invoices.find((item) => item.id === params.id);
-  if (!invoice) return sendError(res, 404, "Invoice not found.");
-  refreshInvoicePaymentStatus(db, invoice);
-  const customer = findCustomer(db, invoice.customerId) || {};
-  const lines = [
-    `Customer: ${customer.name || ""}`,
-    `Phone: ${customer.phone || ""}`,
-    `Date: ${invoice.invoiceDate}`,
-    `Due: ${invoice.dueDate || ""}`,
-    "",
-    ...(invoice.items || []).map((item) => `${item.itemName} | ${item.quantity} x ${formatMoney(db, item.unitPrice)} = ${formatMoney(db, item.lineTotal)}`),
-    "",
-    `Subtotal: ${formatMoney(db, invoice.subtotal)}`,
-    `Discount: ${formatMoney(db, invoice.discount)}`,
-    `Tax: ${formatMoney(db, invoice.tax)}`,
-    `Total: ${formatMoney(db, invoice.totalAmount)}`,
-    `Paid: ${formatMoney(db, invoice.paidAmount)}`,
-    `Balance: ${formatMoney(db, invoice.balanceAmount)}`
-  ];
-  sendPdf(res, `Invoice ${invoice.invoiceNumber}`, lines, `${invoice.invoiceNumber}.pdf`, db);
+  const document = invoicePdfDocument(db, params.id);
+  if (!document) return sendError(res, 404, "Invoice not found.");
+  sendPdf(res, document.title, document.lines, document.fileName, db);
 });
 
 route("GET", "/api/orders", async ({ db, query, res }) => {
@@ -4096,12 +4310,14 @@ route("GET", "/api/payments", async ({ db, query, res }) => {
 });
 
 route("POST", "/api/payments", async ({ db, body, res }) => {
-  const invoice = body.invoiceId ? db.invoices.find((item) => item.id === cleanString(body.invoiceId)) : null;
-  const customerId = cleanString(body.customerId) || (invoice && invoice.customerId) || "";
+  const invoice = body.invoiceId ? db.invoices.find((item) => item.id === cleanString(body.invoiceId) && isActive(item) && item.status !== "CANCELLED") : null;
+  const requestedCustomerId = cleanString(body.customerId);
+  const customerId = invoice ? invoice.customerId : requestedCustomerId;
   const amount = cleanNumber(body.amount);
   if (!customerId || amount <= 0) return sendError(res, 400, "Customer and a positive payment amount are required.");
   if (!findCustomer(db, customerId)) return sendError(res, 404, "Customer not found.");
   if (body.invoiceId && !invoice) return sendError(res, 404, "Invoice not found.");
+  if (invoice && requestedCustomerId && requestedCustomerId !== invoice.customerId) return sendError(res, 400, "Selected invoice belongs to a different customer.");
   if (invoice) {
     refreshInvoicePaymentStatus(db, invoice);
     if (!boolValue(body.allowOverpayment, false) && amount > cleanNumber(invoice.balanceAmount) + 0.001) {
@@ -4109,6 +4325,8 @@ route("POST", "/api/payments", async ({ db, body, res }) => {
     }
   }
   const previousBalance = customerBalance(db, customerId);
+  const invoicePreviousBalance = invoice ? cleanNumber(invoice.balanceAmount) : 0;
+  const invoicePaidBefore = invoice ? cleanNumber(invoice.paidAmount) : 0;
   const payment = {
     id: id("pay"),
     paymentNumber: makeNumber("PAY", db.payments.length),
@@ -4122,6 +4340,10 @@ route("POST", "/api/payments", async ({ db, body, res }) => {
     paymentDate: cleanDate(body.paymentDate),
     previousBalance,
     remainingBalance: Math.max(0, previousBalance - amount),
+    invoiceTotalAmount: invoice ? cleanNumber(invoice.totalAmount) : 0,
+    invoicePaidBefore,
+    invoicePreviousBalance,
+    invoiceRemainingBalance: invoice ? Math.max(0, invoicePreviousBalance - amount) : 0,
     notes: cleanString(body.notes),
     status: "COMPLETED",
     createdAt: nowIso(),
@@ -4179,6 +4401,11 @@ route("PATCH", "/api/payments/:id/void", async ({ db, params, res }) => {
   payment.updatedAt = nowIso();
   const invoice = db.invoices.find((item) => item.id === payment.invoiceId);
   if (invoice) refreshInvoicePaymentStatus(db, invoice);
+  const customer = findCustomer(db, payment.customerId);
+  if (customer) {
+    customer.currentBalance = customerBalance(db, customer.id);
+    customer.updatedAt = nowIso();
+  }
   addActivity(db, "payment_voided", "payment", payment.id, `Payment ${payment.receiptNumber} voided.`);
   await saveDb(db);
   sendJson(res, 200, { success: true, payment: enrichPayment(db, payment) });
@@ -4193,17 +4420,34 @@ route("GET", "/api/payments/:id/receipt", async ({ db, params, res }) => {
 function receiptPrintBody(db, payment) {
   const enriched = enrichPayment(db, payment);
   const customer = enriched.customer || {};
-  const method = cleanString(payment.paymentMethod || payment.method).replaceAll("_", " ");
+  if (enriched.invoice) refreshInvoicePaymentStatus(db, enriched.invoice);
+  const method = titleCaseEnum(payment.paymentMethod || payment.method);
   return `
-    <h2>Receipt ${escapeHtml(payment.receiptNumber)}</h2>
-    <p><strong>Customer:</strong> ${escapeHtml(customer.name || "")}<br><strong>Phone:</strong> ${escapeHtml(customer.phone || "")}<br><strong>Date:</strong> ${escapeHtml(payment.paymentDate)}<br><strong>Payment Method:</strong> ${escapeHtml(method)}</p>
-    ${enriched.invoice ? `<p><strong>Invoice:</strong> ${escapeHtml(enriched.invoice.invoiceNumber)}</p>` : ""}
+    <section class="doc-title-row">
+      <div>
+        <h2>Payment Receipt</h2>
+        <div class="muted">${escapeHtml(payment.receiptNumber)}</div>
+      </div>
+      <div class="doc-meta">
+        <div class="meta-item"><span>Payment Date</span><br><strong>${escapeHtml(payment.paymentDate)}</strong></div>
+        <div class="meta-item"><span>Method</span><br><strong>${escapeHtml(method)}</strong></div>
+        <div class="meta-item"><span>Invoice</span><br><strong>${escapeHtml(enriched.invoice?.invoiceNumber || "N/A")}</strong></div>
+        <div class="meta-item"><span>Status</span><br><strong>${escapeHtml(payment.status || "COMPLETED")}</strong></div>
+      </div>
+    </section>
+    <section class="info-grid">
+      <div class="doc-box"><h3>Customer</h3><strong>${escapeHtml(customer.name || "")}</strong><br>${escapeHtml(customer.phone || "")}<br>${escapeHtml(customer.address || "")}</div>
+      <div class="doc-box"><h3>Receipt Details</h3>Receipt Number: ${escapeHtml(payment.receiptNumber)}<br>Linked Invoice: ${escapeHtml(enriched.invoice?.invoiceNumber || "N/A")}</div>
+    </section>
+    <div class="amount-highlight">Amount Received: ${formatMoney(db, payment.amount)}</div>
     <table><tbody>
       <tr><td>Previous Balance</td><td>${formatMoney(db, payment.previousBalance)}</td></tr>
       <tr><td>Amount Received</td><td>${formatMoney(db, payment.amount)}</td></tr>
-      <tr><td>Remaining Balance</td><td>${formatMoney(db, customerBalance(db, payment.customerId))}</td></tr>
+      <tr><td>Remaining Customer Balance</td><td>${formatMoney(db, customerBalance(db, payment.customerId))}</td></tr>
+      ${enriched.invoice ? `<tr><td>Invoice Balance Before Payment</td><td>${formatMoney(db, payment.invoicePreviousBalance ?? enriched.invoice.totalAmount)}</td></tr>` : ""}
+      ${enriched.invoice ? `<tr><td>Invoice Balance After Payment</td><td>${formatMoney(db, payment.invoiceRemainingBalance ?? enriched.invoice.balanceAmount)}</td></tr>` : ""}
     </tbody></table>
-    <p>${escapeHtml(payment.notes)}</p>
+    <p class="muted">${escapeHtml(payment.notes || "")}</p>
   `;
 }
 
@@ -4214,25 +4458,9 @@ route("GET", "/api/payments/:id/receipt/print", async ({ db, params, res }) => {
 });
 
 route("GET", "/api/payments/:id/receipt/pdf", async ({ db, params, res }) => {
-  const payment = db.payments.find((item) => item.id === params.id);
-  if (!payment) return sendError(res, 404, "Payment not found.");
-  const customer = findCustomer(db, payment.customerId) || {};
-  sendPdf(
-    res,
-    `Receipt ${payment.receiptNumber}`,
-    [
-      `Customer: ${customer.name || ""}`,
-      `Phone: ${customer.phone || ""}`,
-      `Date: ${payment.paymentDate}`,
-      `Payment Method: ${payment.paymentMethod || payment.method}`,
-      `Previous Balance: ${formatMoney(db, payment.previousBalance)}`,
-      `Amount Received: ${formatMoney(db, payment.amount)}`,
-      `Remaining Balance: ${formatMoney(db, customerBalance(db, payment.customerId))}`,
-      `Notes: ${payment.notes || ""}`
-    ],
-    `${payment.receiptNumber}.pdf`,
-    db
-  );
+  const document = receiptPdfDocument(db, params.id);
+  if (!document) return sendError(res, 404, "Payment not found.");
+  sendPdf(res, document.title, document.lines, document.fileName, db);
 });
 
 route("GET", "/api/expenses", async ({ db, query, res }) => {
@@ -4272,6 +4500,8 @@ route("PATCH", "/api/expenses/:id", async ({ db, params, body, res }) => {
   const expense = db.expenses.find((item) => item.id === params.id);
   if (!expense) return sendError(res, 404, "Expense not found.");
   const paymentMethod = normalizePaymentMethod(body.paymentMethod ?? body.method ?? expense.paymentMethod ?? expense.method ?? "CASH");
+  const previousReceiptFileId = cleanString(expense.receiptFileId);
+  const nextReceiptFileId = body.receiptFileId === undefined ? previousReceiptFileId : cleanString(body.receiptFileId);
   Object.assign(expense, {
     title: cleanString(body.title ?? expense.title),
     category: cleanString(body.category ?? expense.category),
@@ -4279,12 +4509,30 @@ route("PATCH", "/api/expenses/:id", async ({ db, params, body, res }) => {
     paymentMethod,
     method: paymentMethod,
     expenseDate: cleanDate(body.expenseDate ?? expense.expenseDate),
-    receiptFileId: cleanString(body.receiptFileId ?? expense.receiptFileId),
-    receiptFileName: cleanString(body.receiptFileName ?? expense.receiptFileName),
+    receiptFileId: nextReceiptFileId,
+    receiptFileName: body.receiptFileName === undefined ? cleanString(expense.receiptFileName) : cleanString(body.receiptFileName),
     notes: cleanString(body.notes ?? expense.notes),
     updatedAt: nowIso()
   });
+  if (previousReceiptFileId && previousReceiptFileId !== nextReceiptFileId) {
+    markUploadedFileDeleted(db, previousReceiptFileId);
+    addActivity(db, nextReceiptFileId ? "expense_attachment_replaced" : "expense_attachment_removed", "expense", expense.id, `Receipt attachment ${nextReceiptFileId ? "replaced" : "removed"} for ${expense.title}.`);
+  }
   addActivity(db, "expense_updated", "expense", expense.id, `Expense ${expense.title} updated.`);
+  await saveDb(db);
+  sendJson(res, 200, { success: true, expense });
+});
+
+route("DELETE", "/api/expenses/:id/attachment", async ({ db, params, res }) => {
+  const expense = db.expenses.find((item) => item.id === params.id);
+  if (!expense) return sendError(res, 404, "Expense not found.");
+  if (!expense.receiptFileId) return sendError(res, 404, "Expense attachment not found.");
+  const oldFileId = expense.receiptFileId;
+  markUploadedFileDeleted(db, oldFileId);
+  expense.receiptFileId = "";
+  expense.receiptFileName = "";
+  expense.updatedAt = nowIso();
+  addActivity(db, "expense_attachment_removed", "expense", expense.id, `Receipt attachment removed for ${expense.title}.`);
   await saveDb(db);
   sendJson(res, 200, { success: true, expense });
 });
@@ -4309,15 +4557,20 @@ route("GET", "/api/reports/summary", async ({ db, query, res }) => {
 route("GET", "/api/reports/summary/csv", async ({ db, query, res }) => {
   const report = reportForRange(db, query.from || todayDate().slice(0, 7) + "-01", query.to || todayDate());
   const rows = [
-    { label: "Orders", value: report.totals.orders },
-    { label: "Sales", value: currency(report.totals.sales) },
-    { label: "Payments Collected", value: currency(report.totals.paymentsCollected) },
-    { label: "Purchases", value: currency(report.totals.purchaseTotal) },
-    { label: "Expenses", value: currency(report.totals.expenseTotal) },
-    { label: "Estimated Profit", value: currency(report.totals.estimatedProfit) },
-    { label: "Outstanding Balance", value: currency(report.totals.outstandingBalance) }
+    { label: "Orders", value: report.totals.orders, type: "Count" },
+    { label: "Invoices", value: report.totals.invoices, type: "Count" },
+    { label: "Unpaid Invoices", value: report.totals.unpaidInvoices, type: "Count" },
+    { label: "Payments", value: report.totals.payments, type: "Count" },
+    { label: "Sales", value: csvNumber(report.totals.sales), type: "Currency" },
+    { label: "Payments Collected", value: csvNumber(report.totals.paymentsCollected), type: "Currency" },
+    { label: "Purchases", value: csvNumber(report.totals.purchaseTotal), type: "Currency" },
+    { label: "Expenses", value: csvNumber(report.totals.expenseTotal), type: "Currency" },
+    { label: "Estimated Profit", value: csvNumber(report.totals.estimatedProfit), type: "Currency" },
+    { label: "Outstanding Balance", value: csvNumber(report.totals.outstandingBalance), type: "Currency" },
+    { label: "Inventory Value", value: csvNumber(report.totals.inventoryValue), type: "Currency" }
   ];
-  sendText(res, 200, toCsv(rows, [{ label: "Metric", value: "label" }, { label: "Value", value: "value" }]), "text/csv; charset=utf-8", { "Content-Disposition": `attachment; filename="dawngas-summary-report-${todayDate()}.csv"` });
+  const csv = businessCsv(db, "Business Summary Report", rows, [{ label: "Metric", value: "label" }, { label: "Value", value: "value" }, { label: "Value Type", value: "type" }], { dateRange: `${report.from} to ${report.to}` });
+  sendText(res, 200, csv, "text/csv; charset=utf-8", { "Content-Disposition": `attachment; filename="dawngas-summary-report-${todayDate()}.csv"` });
 });
 
 route("GET", "/api/reports/summary/xlsx", async ({ db, query, res }) => {
@@ -4334,15 +4587,16 @@ route("GET", "/api/reports/summary/pdf", async ({ db, query, res }) => {
   const lines = [
     `Date Range: ${report.from} to ${report.to}`,
     "",
-    ...Object.entries(report.totals).map(([metric, value]) => `${metric}: ${typeof value === "number" ? formatMoney(db, value) : value}`)
+    "Business Summary",
+    ...Object.entries(report.totals).map(([metric, value]) => `${humanizeKey(metric)}: ${formatReportMetricValue(db, metric, value)}`)
   ];
   sendPdf(res, "Business Report", lines, `dawngas-summary-report-${todayDate()}.pdf`, db);
 });
 
 route("GET", "/api/reports/summary/print", async ({ db, query, res }) => {
   const report = reportForRange(db, query.from || todayDate().slice(0, 7) + "-01", query.to || todayDate());
-  const rows = Object.entries(report.totals).map(([key, value]) => `<tr><td>${escapeHtml(key)}</td><td>${typeof value === "number" ? currency(value) : escapeHtml(value)}</td></tr>`).join("");
-  sendText(res, 200, printableHtml(db, "Business Report", `<h2>Business Report</h2><p>${escapeHtml(report.from)} to ${escapeHtml(report.to)}</p><table><tbody>${rows}</tbody></table>`), "text/html; charset=utf-8");
+  const rows = Object.entries(report.totals).map(([key, value]) => `<tr><td>${escapeHtml(humanizeKey(key))}</td><td>${escapeHtml(formatReportMetricValue(db, key, value))}</td></tr>`).join("");
+  sendText(res, 200, printableHtml(db, "Business Report", `<section class="doc-title-row"><div><h2>Business Report</h2><div class="muted">${escapeHtml(report.from)} to ${escapeHtml(report.to)}</div></div><div class="doc-meta"><div class="meta-item"><span>Generated</span><br><strong>${todayDate()}</strong></div><div class="meta-item"><span>Currency</span><br><strong>${escapeHtml(getBranding(db).currency || "PKR")}</strong></div></div></section><table><tbody>${rows}</tbody></table>`), "text/html; charset=utf-8");
 });
 
 function buildNamedReport(db, type, query = {}) {
@@ -4413,6 +4667,7 @@ function buildNamedReport(db, type, query = {}) {
         paidAmount: item.paidAmount,
         balanceAmount: item.balanceAmount,
         status: item.status,
+        paymentStatus: item.paymentStatus,
         invoiceDate: item.invoiceDate
       };
     });
@@ -4452,7 +4707,10 @@ function reportToCsv(db, report) {
   ];
   const rows = report.rows || [];
   if (!rows.length) return metadata.map((row) => row.join(",")).join("\n") + "\nNo records";
-  const headers = Object.keys(rows[0]).map((key) => ({ label: key.replace(/([A-Z])/g, " $1").replace(/^./, (letter) => letter.toUpperCase()), value: key }));
+  const headers = Object.keys(rows[0]).map((key) => ({
+    label: humanizeKey(key),
+    value: (row) => key === "metric" ? humanizeKey(row[key]) : typeof row[key] === "number" ? (REPORT_MONEY_METRICS.has(row.metric || key) ? csvNumber(row[key]) : formatQuantity(row[key])) : row[key]
+  }));
   return `${metadata.map((row) => row.map(csvEscape).join(",")).join("\n")}\n${toCsv(rows, headers)}`;
 }
 
@@ -4476,9 +4734,9 @@ route("GET", "/api/reports/export/xlsx", async ({ db, query, res }) => {
 route("GET", "/api/reports/export/pdf", async ({ db, query, res }) => {
   const report = buildNamedReport(db, query.type || "profit", query);
   const { rows, headers } = reportRowsAndHeaders(report);
-  const lines = [`Date Range: ${report.from} to ${report.to}`, "", headers.join(" | ")];
+  const lines = [`Date Range: ${report.from} to ${report.to}`, "", headers.map(humanizeKey).join(" | ")];
   for (const row of rows.slice(0, 45)) {
-    lines.push(headers.map((header) => row[header] ?? "").join(" | "));
+    lines.push(headers.map((header) => formatReportCell(db, header === "value" && row.metric ? row.metric : header, row[header])).join(" | "));
   }
   if (rows.length > 45) lines.push(`... ${rows.length - 45} more rows in CSV/XLSX export`);
   sendPdf(res, report.title, lines, `dawngas-${slug(report.title)}-${todayDate()}.pdf`, db);
@@ -4945,6 +5203,149 @@ route("GET", "/api/activity-logs", async ({ db, res }) => {
   sendJson(res, 200, { success: true, activityLogs: db.activityLogs.slice(0, 300) });
 });
 
+function isRecycleRecord(record) {
+  return record && (record.archivedAt || record.deletedAt || cleanString(record.status).toUpperCase() === "ARCHIVED");
+}
+
+function pushDependency(dependencies, type, count) {
+  const numericCount = cleanNumber(count);
+  if (numericCount > 0) dependencies.push({ type, count: numericCount });
+}
+
+function countRecords(records, predicate) {
+  return Array.isArray(records) ? records.filter(predicate).length : 0;
+}
+
+function countNestedRows(records, rowsForRecord, predicate) {
+  if (!Array.isArray(records)) return 0;
+  return records.reduce((count, record) => count + (Array.isArray(rowsForRecord(record)) ? rowsForRecord(record).filter(predicate).length : 0), 0);
+}
+
+function permanentDeleteBlockers(db, collection, record) {
+  const idValue = record && record.id;
+  const dependencies = [];
+  if (!idValue) return [{ type: "Record Identity", count: 1 }];
+
+  if (collection === "customers") {
+    const invoiceCount = countRecords(db.invoices, (item) => item.customerId === idValue);
+    const paymentCount = countRecords(db.payments, (item) => item.customerId === idValue);
+    const orderCount = countRecords(db.orders, (item) => item.customerId === idValue);
+    const deliveryCount = countRecords(db.deliveries, (item) => item.customerId === idValue);
+    pushDependency(dependencies, "Invoices", invoiceCount);
+    pushDependency(dependencies, "Payments", paymentCount);
+    pushDependency(dependencies, "Orders", orderCount);
+    pushDependency(dependencies, "Deliveries", deliveryCount);
+    pushDependency(dependencies, "Customer Balances", cleanNumber(record.openingBalance) || cleanNumber(record.currentBalance) || cleanNumber(customerBalance(db, idValue)) ? 1 : 0);
+    pushDependency(dependencies, "Reports Source Data", invoiceCount + paymentCount + orderCount + deliveryCount);
+  }
+
+  if (collection === "products") {
+    const invoiceItemCount = countNestedRows(db.invoices, (item) => item.items, (row) => row.productId === idValue);
+    const purchaseItemCount = countNestedRows(db.purchases, (item) => item.items, (row) => row.productId === idValue);
+    const purchaseCount = countRecords(db.purchases, (item) => (item.items || []).some((row) => row.productId === idValue));
+    const orderItemCount = countNestedRows(db.orders, (item) => item.items, (row) => row.productId === idValue);
+    const inventoryMovementCount = countRecords(db.inventoryMovements, (item) => item.productId === idValue);
+    const productionBatchCount = countRecords(db.productionBatches, (item) => item.finishedProductId === idValue || (item.materials || []).some((row) => row.productId === idValue || row.rawMaterialId === idValue));
+    const productionUsageCount = countNestedRows(db.productionBatches, (item) => item.materials, (row) => row.productId === idValue || row.rawMaterialId === idValue);
+    const bomCount = countRecords(db.billOfMaterials, (item) => item.finishedProductId === idValue || item.rawMaterialId === idValue);
+    pushDependency(dependencies, "Invoice Items", invoiceItemCount);
+    pushDependency(dependencies, "Purchase Items", purchaseItemCount);
+    pushDependency(dependencies, "Purchases", purchaseCount);
+    pushDependency(dependencies, "Order Items", orderItemCount);
+    pushDependency(dependencies, "Inventory Movements", inventoryMovementCount);
+    pushDependency(dependencies, "Production Batches", productionBatchCount);
+    pushDependency(dependencies, "Production Material Usage", productionUsageCount);
+    pushDependency(dependencies, "Materials Required", bomCount);
+    pushDependency(dependencies, "Reports Source Data", invoiceItemCount + purchaseItemCount + inventoryMovementCount + productionBatchCount);
+  }
+
+  if (collection === "productCategories") {
+    pushDependency(dependencies, "Products", countRecords(db.products, (item) => item.categoryId === idValue));
+  }
+
+  if (collection === "inventory") {
+    const movementCount = countRecords(db.inventoryMovements, (item) => item.inventoryItemId === idValue || item.productId === record.productId);
+    pushDependency(dependencies, "Inventory Movements", movementCount);
+    pushDependency(dependencies, "Reports Source Data", movementCount);
+  }
+
+  if (collection === "suppliers") {
+    const purchaseCount = countRecords(db.purchases, (item) => item.supplierId === idValue);
+    const purchaseItemCount = countNestedRows(db.purchases.filter((item) => item.supplierId === idValue), (item) => item.items, () => true);
+    pushDependency(dependencies, "Purchases", purchaseCount);
+    pushDependency(dependencies, "Purchase Items", purchaseItemCount);
+    pushDependency(dependencies, "Reports Source Data", purchaseCount);
+  }
+
+  if (collection === "purchases") {
+    const movementCount = countRecords(db.inventoryMovements, (item) => item.referenceId === idValue || (item.referenceType === "PURCHASE" && item.referenceId === idValue));
+    pushDependency(dependencies, "Purchase Items", (record.items || []).length);
+    pushDependency(dependencies, "Received Stock", cleanString(record.status).toUpperCase() === "RECEIVED" ? 1 : 0);
+    pushDependency(dependencies, "Inventory Movements", movementCount);
+    pushDependency(dependencies, "Reports Source Data", 1);
+  }
+
+  if (collection === "invoices") {
+    const paymentCount = countRecords(db.payments, (item) => item.invoiceId === idValue);
+    const deliveryCount = countRecords(db.deliveries, (item) => item.invoiceId === idValue);
+    const movementCount = countRecords(db.inventoryMovements, (item) => item.referenceType === "INVOICE" && item.referenceId === idValue);
+    pushDependency(dependencies, "Invoice Items", (record.items || []).length);
+    pushDependency(dependencies, "Payments", paymentCount);
+    pushDependency(dependencies, "Deliveries", deliveryCount);
+    pushDependency(dependencies, "Inventory Movements", movementCount);
+    pushDependency(dependencies, "Customer Balances", cleanNumber(record.totalAmount) || cleanNumber(record.balanceAmount) ? 1 : 0);
+    pushDependency(dependencies, "Reports Source Data", 1);
+  }
+
+  if (collection === "payments") {
+    pushDependency(dependencies, "Linked Invoice", record.invoiceId ? 1 : 0);
+    pushDependency(dependencies, "Linked Order", record.orderId ? 1 : 0);
+    pushDependency(dependencies, "Customer Balances", 1);
+    pushDependency(dependencies, "Reports Source Data", 1);
+  }
+
+  if (collection === "orders") {
+    const invoiceCount = countRecords(db.invoices, (item) => item.orderId === idValue);
+    const paymentCount = countRecords(db.payments, (item) => item.orderId === idValue);
+    const deliveryCount = countRecords(db.deliveries, (item) => item.orderId === idValue);
+    const movementCount = countRecords(db.inventoryMovements, (item) => item.referenceType === "ORDER" && item.referenceId === idValue);
+    pushDependency(dependencies, "Order Items", (record.items || []).length);
+    pushDependency(dependencies, "Invoices", invoiceCount);
+    pushDependency(dependencies, "Payments", paymentCount);
+    pushDependency(dependencies, "Deliveries", deliveryCount);
+    pushDependency(dependencies, "Inventory Movements", movementCount);
+    pushDependency(dependencies, "Reports Source Data", 1);
+  }
+
+  if (collection === "productionBatches") {
+    const movementCount = countRecords(db.inventoryMovements, (item) => item.referenceType === "PRODUCTION" && item.referenceId === idValue);
+    pushDependency(dependencies, "Production Material Usage", (record.materials || []).length);
+    pushDependency(dependencies, "Inventory Movements", movementCount);
+    pushDependency(dependencies, "Reports Source Data", 1);
+  }
+
+  if (collection === "expenses") {
+    pushDependency(dependencies, "Reports Source Data", 1);
+  }
+
+  if (collection === "masterData") {
+    if (record.type === "storageLocations") pushDependency(dependencies, "Inventory Records", countRecords(db.inventory, (item) => item.storageLocationId === idValue || item.storageLocation === record.value));
+    if (record.type === "unitsOfMeasure") pushDependency(dependencies, "Products", countRecords(db.products, (item) => item.unitOfMeasure === record.value));
+    if (record.type === "itemTypes") pushDependency(dependencies, "Products", countRecords(db.products, (item) => normalizeItemType(item.itemType) === normalizeItemType(record.value)));
+  }
+
+  return dependencies;
+}
+
+function markUploadedFileDeleted(db, fileId) {
+  if (!Array.isArray(db.fileUploads)) return;
+  const file = db.fileUploads.find((item) => item.id === cleanString(fileId));
+  if (file) {
+    file.deletedAt = nowIso();
+    file.updatedAt = nowIso();
+  }
+}
+
 route("GET", "/api/recycle-bin", async ({ db, query, res }) => {
   const rows = [];
   const collections = ["customers", "productCategories", "products", "inventory", "suppliers", "purchases", "invoices", "payments", "orders", "deliveries", "expenses", "notes", "attachments", "masterData"];
@@ -4999,11 +5400,31 @@ route("DELETE", "/api/recycle-bin/:type/:id", async ({ db, params, res }) => {
 
 route("DELETE", "/api/recycle-bin/:type/:id/permanent", async ({ db, params, res }) => {
   const collection = ENTITY_COLLECTIONS[params.type] || params.type;
-  const safeCollections = new Set(["notes", "attachments"]);
-  if (!safeCollections.has(collection)) return sendError(res, 400, "Permanent delete is only enabled for non-financial records.");
+  if (!db[collection] || !Array.isArray(db[collection])) return sendError(res, 400, "Invalid recycle bin type.");
   const index = db[collection].findIndex((item) => item.id === params.id);
   if (index === -1) return sendError(res, 404, "Record not found.");
-  const [record] = db[collection].splice(index, 1);
+  const record = db[collection][index];
+  if (!isRecycleRecord(record)) return sendError(res, 400, "Only records already in the recycle bin can be permanently deleted.");
+  const dependencies = permanentDeleteBlockers(db, collection, record);
+  if (dependencies.length) {
+    addActivity(
+      db,
+      "record_permanent_delete_blocked",
+      collection,
+      record.id,
+      `${collection} record permanent delete blocked because it is linked to business history.`,
+      { dependencies }
+    );
+    await saveDb(db);
+    return sendJson(res, 409, {
+      success: false,
+      message: "Permanent delete blocked because this record is linked to business history.",
+      dependencies
+    });
+  }
+  db[collection].splice(index, 1);
+  if (collection === "attachments") markUploadedFileDeleted(db, record.fileUploadId || record.id);
+  if (collection === "expenses" && record.receiptFileId) markUploadedFileDeleted(db, record.receiptFileId);
   addActivity(db, "record_permanently_deleted", collection, record.id, `${collection} record permanently deleted.`);
   await saveDb(db);
   sendJson(res, 200, { success: true });
@@ -5084,35 +5505,52 @@ route("POST", "/api/backup/restore", async ({ db, body, res }) => {
 
 route("GET", "/api/exports/:type/csv", async ({ db, params, res }) => {
   const type = params.type;
-  let csv = "";
+  let title = "";
+  let rows = [];
+  let headers = [];
+  let totals = [];
   if (type === "customers") {
-    csv = toCsv(db.customers.filter(isActive).map((item) => enrichCustomer(db, item)), [
+    title = "Customer Export";
+    rows = db.customers.filter(isActive).map((item) => enrichCustomer(db, item));
+    headers = [
       { label: "Name", value: "name" },
       { label: "Phone", value: "phone" },
+      { label: "Email", value: "email" },
       { label: "Address", value: "address" },
-      { label: "Balance", value: (row) => currency(row.balance) },
+      { label: "Balance", value: (row) => csvNumber(row.balance) },
       { label: "Total Orders", value: "totalOrders" }
-    ]);
+    ];
+    totals = [["Total Customers", rows.length], ["Total Balance", csvNumber(rows.reduce((sum, row) => sum + cleanNumber(row.balance), 0))]];
   } else if (type === "payments") {
-    csv = toCsv(activePayments(db), [
-      { label: "Receipt", value: "receiptNumber" },
+    title = "Payment Export";
+    rows = activePayments(db);
+    headers = [
+      { label: "Receipt Number", value: "receiptNumber" },
       { label: "Customer", value: (row) => (findCustomer(db, row.customerId) || {}).name || "" },
-      { label: "Amount", value: (row) => currency(row.amount) },
-      { label: "Method", value: (row) => row.paymentMethod || row.method },
-      { label: "Date", value: "paymentDate" }
-    ]);
+      { label: "Invoice Number", value: (row) => (db.invoices.find((invoice) => invoice.id === row.invoiceId) || {}).invoiceNumber || "" },
+      { label: "Payment Date", value: (row) => csvDate(row.paymentDate) },
+      { label: "Method", value: (row) => titleCaseEnum(row.paymentMethod || row.method) },
+      { label: "Amount", value: (row) => csvNumber(row.amount) },
+      { label: "Status", value: "status" }
+    ];
+    totals = [["Total Payments", rows.length], ["Amount Received", csvNumber(rows.reduce((sum, row) => sum + cleanNumber(row.amount), 0))]];
   } else if (type === "expenses") {
-    csv = toCsv(activeExpenses(db), [
+    title = "Expense Export";
+    rows = activeExpenses(db);
+    headers = [
       { label: "Title", value: "title" },
-      { label: "Category", value: "category" },
-      { label: "Amount", value: (row) => currency(row.amount) },
-      { label: "Method", value: (row) => row.paymentMethod || row.method },
-      { label: "Date", value: "expenseDate" },
-      { label: "Receipt", value: "receiptFileName" },
+      { label: "Category", value: (row) => humanizeKey(row.category) },
+      { label: "Expense Date", value: (row) => csvDate(row.expenseDate) },
+      { label: "Payment Method", value: (row) => titleCaseEnum(row.paymentMethod || row.method) },
+      { label: "Amount", value: (row) => csvNumber(row.amount) },
+      { label: "Receipt Attachment", value: "receiptFileName" },
       { label: "Notes", value: "notes" }
-    ]);
+    ];
+    totals = [["Total Expenses", rows.length], ["Expense Total", csvNumber(rows.reduce((sum, row) => sum + cleanNumber(row.amount), 0))]];
   } else if (type === "inventory") {
-    csv = toCsv(db.inventory.filter(isActive).map((item) => enrichInventory(db, item)), [
+    title = "Inventory Export";
+    rows = db.inventory.filter(isActive).map((item) => enrichInventory(db, item));
+    headers = [
       { label: "Item Name", value: (row) => (row.product || {}).name || "" },
       { label: "Item Type", value: (row) => displayItemType(row.itemType) },
       { label: "Category", value: "categoryName" },
@@ -5123,24 +5561,77 @@ route("GET", "/api/exports/:type/csv", async ({ db, params, res }) => {
       { label: "Available Stock", value: "availableStock" },
       { label: "Low Stock Threshold", value: "lowStockThreshold" },
       { label: "Reorder Quantity", value: "reorderQuantity" },
-      { label: "Storage Location", value: "storageLocation" },
+      { label: "Storage Location", value: (row) => row.storageLocationName || row.storageLocationSnapshotName || row.storageLocation },
       { label: "Stock Status", value: "status" }
-    ]);
+    ];
+    totals = [["Inventory Items", rows.length], ["Inventory Value", csvNumber(inventoryValue(db))]];
   } else if (type === "products") {
-    csv = toCsv(db.products.filter(isActive).map((item) => enrichProduct(db, item)), [
+    title = "Product Export";
+    rows = db.products.filter(isActive).map((item) => enrichProduct(db, item));
+    headers = [
       { label: "Item Name", value: "name" },
+      { label: "SKU", value: "sku" },
       { label: "Item Type", value: (row) => displayItemType(row.itemType) },
       { label: "Category", value: "categoryName" },
-      { label: "SKU", value: "sku" },
       { label: "Unit", value: "unitOfMeasure" },
-      { label: "Cost Price", value: (row) => currency(row.costPrice) },
-      { label: "Selling Price", value: (row) => currency(row.sellingPrice || row.standardServiceCharge) },
+      { label: "Cost Price", value: (row) => csvNumber(row.costPrice) },
+      { label: "Selling Price", value: (row) => csvNumber(row.sellingPrice || row.standardServiceCharge) },
+      { label: "Current Stock", value: (row) => row.stock ? row.stock.currentStock : "" },
+      { label: "Low Stock Threshold", value: (row) => row.stock ? row.stock.lowStockThreshold : "" },
+      { label: "Stock Status", value: (row) => row.trackInventory ? row.stockStatus : "NOT_TRACKED" },
+      { label: "Storage Location", value: (row) => row.stock ? storageLocationLabel(db, row.stock) : "" },
       { label: "Track Inventory", value: (row) => (row.trackInventory ? "Yes" : "No") },
       { label: "Status", value: "status" }
-    ]);
+    ];
+    totals = [["Total Products", rows.length]];
+  } else if (type === "suppliers") {
+    title = "Supplier Export";
+    rows = db.suppliers.filter(isActive).map((item) => enrichSupplier(db, item));
+    headers = [
+      { label: "Supplier Name", value: "name" },
+      { label: "Contact Person", value: "contactPerson" },
+      { label: "Phone", value: "phone" },
+      { label: "Email", value: "email" },
+      { label: "Address", value: "address" },
+      { label: "Total Purchases", value: "totalPurchases" },
+      { label: "Purchase Total", value: (row) => csvNumber(row.purchaseTotal) },
+      { label: "Outstanding Balance", value: (row) => csvNumber(row.outstandingBalance) },
+      { label: "Status", value: "status" }
+    ];
+    totals = [["Total Suppliers", rows.length], ["Outstanding Balance", csvNumber(rows.reduce((sum, row) => sum + cleanNumber(row.outstandingBalance), 0))]];
+  } else if (type === "purchases") {
+    title = "Purchase Export";
+    rows = db.purchases.filter(isActive).map((item) => enrichPurchase(db, item));
+    headers = [
+      { label: "Purchase Number", value: "purchaseNumber" },
+      { label: "Supplier", value: (row) => row.supplier?.name || "" },
+      { label: "Purchase Date", value: (row) => csvDate(row.purchaseDate) },
+      { label: "Items", value: (row) => (row.items || []).map((item) => `${item.itemName || item.product?.name || ""} x ${item.quantity}`).join("; ") },
+      { label: "Total", value: (row) => csvNumber(row.totalAmount) },
+      { label: "Paid", value: (row) => csvNumber(row.paidAmount) },
+      { label: "Balance", value: (row) => csvNumber(row.balanceAmount) },
+      { label: "Invoice Status", value: "status" },
+      { label: "Payment Status", value: "paymentStatus" }
+    ];
+    totals = [["Total Purchases", rows.length], ["Purchase Total", csvNumber(rows.reduce((sum, row) => sum + cleanNumber(row.totalAmount), 0))]];
+  } else if (type === "invoices") {
+    title = "Invoice Export";
+    rows = activeInvoices(db).map((item) => enrichInvoice(db, item));
+    headers = [
+      { label: "Invoice Number", value: "invoiceNumber" },
+      { label: "Customer", value: (row) => row.customer?.name || "" },
+      { label: "Invoice Date", value: (row) => csvDate(row.invoiceDate) },
+      { label: "Due Date", value: (row) => csvDate(row.dueDate) },
+      { label: "Total", value: (row) => csvNumber(row.totalAmount) },
+      { label: "Paid", value: (row) => csvNumber(row.paidAmount) },
+      { label: "Balance", value: (row) => csvNumber(row.balanceAmount) },
+      { label: "Status", value: "status" }
+    ];
+    totals = [["Total Invoices", rows.length], ["Invoice Total", csvNumber(rows.reduce((sum, row) => sum + cleanNumber(row.totalAmount), 0))], ["Outstanding Balance", csvNumber(rows.reduce((sum, row) => sum + cleanNumber(row.balanceAmount), 0))]];
   } else {
     return sendError(res, 404, "Export type not found.");
   }
+  const csv = businessCsv(db, title, rows, headers, { totals });
   sendText(res, 200, csv, "text/csv; charset=utf-8", { "Content-Disposition": `attachment; filename="dawngas-${type}-${todayDate()}.csv"` });
 });
 
