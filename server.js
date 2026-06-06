@@ -5430,6 +5430,527 @@ route("DELETE", "/api/recycle-bin/:type/:id/permanent", async ({ db, params, res
   sendJson(res, 200, { success: true });
 });
 
+const DATA_CLEANUP_CONFIRM_TEXT = "CLEAR BUSINESS DATA";
+const DELETE_SELECTED_CONFIRM_TEXT = "DELETE SELECTED RECORDS";
+const CLEAN_ORPHANS_CONFIRM_TEXT = "CLEAN ORPHANS";
+
+const DATA_MANAGEMENT_GROUPS = [
+  { key: "notifications", label: "Notifications", collection: "notifications" },
+  { key: "activityLogs", label: "Activity Logs", collection: "activityLogs" },
+  { key: "notes", label: "Notes", collection: "notes" },
+  { key: "attachments", label: "Attachments", collection: "attachments" },
+  { key: "payments", label: "Payments", collection: "payments" },
+  { key: "deliveries", label: "Deliveries", collection: "deliveries" },
+  { key: "invoiceItems", label: "Invoice Items", derived: true },
+  { key: "invoices", label: "Invoices", collection: "invoices" },
+  { key: "orderItems", label: "Order Items", derived: true },
+  { key: "orders", label: "Orders", collection: "orders" },
+  { key: "productionMaterialUsages", label: "Production Material Usage", collection: "productionMaterialUsages" },
+  { key: "productionBatches", label: "Production Batches", collection: "productionBatches" },
+  { key: "purchaseItems", label: "Purchase Items", derived: true },
+  { key: "purchases", label: "Purchases", collection: "purchases" },
+  { key: "inventoryMovements", label: "Inventory Movements", collection: "inventoryMovements" },
+  { key: "inventory", label: "Inventory Items", collection: "inventory" },
+  { key: "billOfMaterials", label: "Materials Required", collection: "billOfMaterials" },
+  { key: "products", label: "Products", collection: "products" },
+  { key: "customers", label: "Customers", collection: "customers" },
+  { key: "suppliers", label: "Suppliers", collection: "suppliers" },
+  { key: "expenses", label: "Expenses", collection: "expenses" },
+  { key: "backups", label: "Backup Records", collection: "backups" },
+  { key: "restoreLogs", label: "Restore Logs", collection: "restoreLogs" },
+  { key: "reminderLogs", label: "Reminder Logs", collection: "reminderLogs" }
+];
+
+const DATA_CLEAR_ORDER = DATA_MANAGEMENT_GROUPS.map((item) => item.key);
+const DATA_MANAGEMENT_GROUP_MAP = Object.fromEntries(DATA_MANAGEMENT_GROUPS.map((item) => [item.key, item]));
+
+function dataCleanupEnabled() {
+  return NODE_ENV !== "production" || process.env.ENABLE_DATA_CLEANUP === "true";
+}
+
+function dataCleanupState() {
+  return {
+    enabled: dataCleanupEnabled(),
+    environment: NODE_ENV,
+    requiresEnvOverride: NODE_ENV === "production" && process.env.ENABLE_DATA_CLEANUP !== "true",
+    message: dataCleanupEnabled()
+      ? "Data cleanup tools are enabled for controlled setup/testing cleanup."
+      : "Data cleanup tools are disabled in production."
+  };
+}
+
+function requireDataCleanupEnabled(res) {
+  if (dataCleanupEnabled()) return true;
+  sendJson(res, 403, { success: false, ...dataCleanupState() });
+  return false;
+}
+
+function dataGroupRows(db, key) {
+  if (key === "invoiceItems") return deriveInvoiceItems(db.invoices || []);
+  if (key === "purchaseItems") return derivePurchaseItems(db.purchases || []);
+  if (key === "orderItems") return deriveOrderItems(db.orders || []);
+  const group = DATA_MANAGEMENT_GROUP_MAP[key];
+  return group && group.collection && Array.isArray(db[group.collection]) ? db[group.collection] : [];
+}
+
+function recordLabelForDataManagement(key, record = {}) {
+  if (key === "invoiceItems") {
+    const invoiceNumber = (record.invoiceId || "").split("_item_")[0] || record.invoiceId || "";
+    return `${record.description || record.productName || record.productId || "Invoice item"} (${invoiceNumber})`;
+  }
+  if (key === "purchaseItems") return `${record.productId || "Purchase item"} (${record.purchaseId || ""})`;
+  if (key === "orderItems") return `${record.productName || record.productId || "Order item"} (${record.orderId || ""})`;
+  return (
+    record.name ||
+    record.title ||
+    record.invoiceNumber ||
+    record.receiptNumber ||
+    record.paymentNumber ||
+    record.purchaseNumber ||
+    record.batchNumber ||
+    record.orderNumber ||
+    record.deliveryNumber ||
+    record.fileName ||
+    record.originalName ||
+    record.message ||
+    record.action ||
+    record.id ||
+    "Record"
+  );
+}
+
+function dataRecordPreview(db, key, record = {}) {
+  return {
+    id: record.id,
+    label: recordLabelForDataManagement(key, record),
+    status: record.status || (record.archivedAt || record.deletedAt ? "ARCHIVED" : "ACTIVE"),
+    details: [
+      record.sku,
+      record.phone,
+      record.email,
+      record.customerId ? `Customer ${record.customerId}` : "",
+      record.productId ? `Product ${record.productId}` : "",
+      record.createdAt ? `Created ${String(record.createdAt).slice(0, 10)}` : ""
+    ].filter(Boolean).slice(0, 2).join(" | ")
+  };
+}
+
+function dataManagementSummary(db, options = {}) {
+  const includeRecords = options.includeRecords !== false;
+  const groups = DATA_MANAGEMENT_GROUPS.map((group) => {
+    const rows = dataGroupRows(db, group.key);
+    return {
+      key: group.key,
+      label: group.label,
+      count: rows.length,
+      records: includeRecords ? rows.slice(0, 150).map((record) => dataRecordPreview(db, group.key, record)) : []
+    };
+  });
+  return {
+    ...dataCleanupState(),
+    confirmationText: DATA_CLEANUP_CONFIRM_TEXT,
+    deleteSelectedConfirmationText: DELETE_SELECTED_CONFIRM_TEXT,
+    orphanConfirmationText: CLEAN_ORPHANS_CONFIRM_TEXT,
+    groups,
+    counts: Object.fromEntries(groups.map((group) => [group.key, group.count])),
+    preservedByDefault: ["Owner account", "Login sessions", "Business settings", "Master data", "Uploaded logo", "Backup history"]
+  };
+}
+
+function normalizeSelection(selection = {}) {
+  const normalized = {};
+  for (const group of DATA_MANAGEMENT_GROUPS) {
+    const ids = Array.isArray(selection[group.key]) ? selection[group.key] : [];
+    normalized[group.key] = new Set(ids.map(cleanString).filter(Boolean));
+  }
+  return normalized;
+}
+
+function selectionToPayload(selection = {}) {
+  return Object.fromEntries(Object.entries(selection).map(([key, ids]) => [key, Array.from(ids || [])]));
+}
+
+function addSelected(selection, key, idValue) {
+  if (!idValue || !DATA_MANAGEMENT_GROUP_MAP[key]) return;
+  if (!selection[key]) selection[key] = new Set();
+  selection[key].add(cleanString(idValue));
+}
+
+function addNestedItemSelections(selection, key, rows, parentIdField, parentId) {
+  rows.forEach((row) => {
+    if (row[parentIdField] === parentId) addSelected(selection, key, row.id);
+  });
+}
+
+function expandSelectionWithLinkedDependencies(db, selection) {
+  const expanded = normalizeSelection(selectionToPayload(selection));
+  const invoiceItems = deriveInvoiceItems(db.invoices || []);
+  const purchaseItems = derivePurchaseItems(db.purchases || []);
+  const orderItems = deriveOrderItems(db.orders || []);
+
+  for (const productId of Array.from(expanded.products || [])) {
+    db.inventory.filter((item) => item.productId === productId).forEach((item) => addSelected(expanded, "inventory", item.id));
+    (db.inventoryMovements || []).filter((item) => item.productId === productId).forEach((item) => addSelected(expanded, "inventoryMovements", item.id));
+    db.billOfMaterials.filter((item) => item.finishedProductId === productId || item.rawMaterialId === productId).forEach((item) => addSelected(expanded, "billOfMaterials", item.id));
+    db.invoices.filter((item) => (item.items || []).some((row) => row.productId === productId)).forEach((item) => addSelected(expanded, "invoices", item.id));
+    db.purchases.filter((item) => (item.items || []).some((row) => row.productId === productId)).forEach((item) => addSelected(expanded, "purchases", item.id));
+    db.orders.filter((item) => (item.items || []).some((row) => row.productId === productId)).forEach((item) => addSelected(expanded, "orders", item.id));
+    db.productionBatches.filter((item) => item.finishedProductId === productId).forEach((item) => addSelected(expanded, "productionBatches", item.id));
+    db.productionMaterialUsages.filter((item) => item.rawMaterialId === productId || item.productId === productId).forEach((item) => addSelected(expanded, "productionMaterialUsages", item.id));
+  }
+
+  for (const customerId of Array.from(expanded.customers || [])) {
+    db.invoices.filter((item) => item.customerId === customerId).forEach((item) => addSelected(expanded, "invoices", item.id));
+    db.orders.filter((item) => item.customerId === customerId).forEach((item) => addSelected(expanded, "orders", item.id));
+    db.payments.filter((item) => item.customerId === customerId).forEach((item) => addSelected(expanded, "payments", item.id));
+    db.deliveries.filter((item) => item.customerId === customerId).forEach((item) => addSelected(expanded, "deliveries", item.id));
+    db.notes.filter((item) => item.entityType === "customer" && item.entityId === customerId).forEach((item) => addSelected(expanded, "notes", item.id));
+    db.attachments.filter((item) => item.entityType === "customer" && item.entityId === customerId).forEach((item) => addSelected(expanded, "attachments", item.id));
+  }
+
+  for (const supplierId of Array.from(expanded.suppliers || [])) {
+    db.purchases.filter((item) => item.supplierId === supplierId).forEach((item) => addSelected(expanded, "purchases", item.id));
+  }
+
+  for (const invoiceId of Array.from(expanded.invoices || [])) {
+    addNestedItemSelections(expanded, "invoiceItems", invoiceItems, "invoiceId", invoiceId);
+    db.payments.filter((item) => item.invoiceId === invoiceId).forEach((item) => addSelected(expanded, "payments", item.id));
+    db.deliveries.filter((item) => item.invoiceId === invoiceId).forEach((item) => addSelected(expanded, "deliveries", item.id));
+    (db.inventoryMovements || []).filter((item) => item.referenceType === "INVOICE" && item.referenceId === invoiceId).forEach((item) => addSelected(expanded, "inventoryMovements", item.id));
+  }
+
+  for (const orderId of Array.from(expanded.orders || [])) {
+    addNestedItemSelections(expanded, "orderItems", orderItems, "orderId", orderId);
+    db.invoices.filter((item) => item.orderId === orderId).forEach((item) => addSelected(expanded, "invoices", item.id));
+    db.payments.filter((item) => item.orderId === orderId).forEach((item) => addSelected(expanded, "payments", item.id));
+    db.deliveries.filter((item) => item.orderId === orderId).forEach((item) => addSelected(expanded, "deliveries", item.id));
+  }
+
+  for (const purchaseId of Array.from(expanded.purchases || [])) {
+    addNestedItemSelections(expanded, "purchaseItems", purchaseItems, "purchaseId", purchaseId);
+    (db.inventoryMovements || []).filter((item) => item.referenceType === "PURCHASE" && item.referenceId === purchaseId).forEach((item) => addSelected(expanded, "inventoryMovements", item.id));
+  }
+
+  for (const batchId of Array.from(expanded.productionBatches || [])) {
+    db.productionMaterialUsages.filter((item) => item.productionBatchId === batchId).forEach((item) => addSelected(expanded, "productionMaterialUsages", item.id));
+    (db.inventoryMovements || []).filter((item) => item.referenceType === "PRODUCTION" && item.referenceId === batchId).forEach((item) => addSelected(expanded, "inventoryMovements", item.id));
+  }
+
+  return expanded;
+}
+
+function selectedCleanupPreview(db, rawSelection = {}, options = {}) {
+  const base = normalizeSelection(rawSelection);
+  const selection = options.includeLinkedDependencies ? expandSelectionWithLinkedDependencies(db, base) : base;
+  const selected = [];
+  const dependencies = [];
+
+  for (const group of DATA_MANAGEMENT_GROUPS) {
+    const ids = selection[group.key] || new Set();
+    if (!ids.size) continue;
+    const rows = dataGroupRows(db, group.key).filter((record) => ids.has(record.id));
+    if (rows.length) selected.push({ key: group.key, label: group.label, count: rows.length, records: rows.slice(0, 50).map((record) => dataRecordPreview(db, group.key, record)) });
+    for (const record of rows) {
+      if (group.collection) {
+        const blockers = permanentDeleteBlockers(db, group.collection, record);
+        if (blockers.length) dependencies.push({ group: group.label, recordId: record.id, label: recordLabelForDataManagement(group.key, record), dependencies: blockers });
+      }
+    }
+  }
+
+  return {
+    selected,
+    selection: selectionToPayload(selection),
+    dependencies,
+    totalSelected: selected.reduce((sum, group) => sum + group.count, 0),
+    includeLinkedDependencies: options.includeLinkedDependencies === true
+  };
+}
+
+function parseDerivedItemId(itemId) {
+  const match = cleanString(itemId).match(/^(.+)_item_(\d+)$/);
+  if (!match) return null;
+  return { parentId: match[1], index: Number(match[2]) - 1 };
+}
+
+function recalculatePurchaseTotals(purchase) {
+  purchase.subtotal = (purchase.items || []).reduce((sum, item) => sum + cleanNumber(item.lineTotal || cleanNumber(item.quantity) * cleanNumber(item.unitCost)), 0);
+  purchase.totalAmount = Math.max(0, cleanNumber(purchase.subtotal) - cleanNumber(purchase.discount) + cleanNumber(purchase.tax));
+  purchase.paidAmount = Math.max(0, cleanNumber(purchase.paidAmount));
+  purchase.balanceAmount = Math.max(0, cleanNumber(purchase.totalAmount) - cleanNumber(purchase.paidAmount));
+  purchase.updatedAt = nowIso();
+}
+
+function deleteNestedItems(db, key, ids) {
+  let deleted = 0;
+  for (const itemId of ids) {
+    const parsed = parseDerivedItemId(itemId);
+    if (!parsed) continue;
+    if (key === "invoiceItems") {
+      const invoice = db.invoices.find((item) => item.id === parsed.parentId);
+      if (invoice && Array.isArray(invoice.items) && invoice.items[parsed.index]) {
+        invoice.items.splice(parsed.index, 1);
+        recalculateInvoiceTotals(invoice);
+        refreshInvoicePaymentStatus(db, invoice);
+        deleted += 1;
+      }
+    }
+    if (key === "purchaseItems") {
+      const purchase = db.purchases.find((item) => item.id === parsed.parentId);
+      if (purchase && Array.isArray(purchase.items) && purchase.items[parsed.index]) {
+        purchase.items.splice(parsed.index, 1);
+        recalculatePurchaseTotals(purchase);
+        deleted += 1;
+      }
+    }
+    if (key === "orderItems") {
+      const order = db.orders.find((item) => item.id === parsed.parentId);
+      if (order && Array.isArray(order.items) && order.items[parsed.index]) {
+        order.items.splice(parsed.index, 1);
+        order.updatedAt = nowIso();
+        deleted += 1;
+      }
+    }
+  }
+  return deleted;
+}
+
+function deleteRecordsBySelection(db, selection) {
+  const deleted = [];
+  for (const key of DATA_CLEAR_ORDER) {
+    const ids = selection[key] || new Set();
+    if (!ids.size) continue;
+    if (["invoiceItems", "purchaseItems", "orderItems"].includes(key)) {
+      const count = deleteNestedItems(db, key, ids);
+      if (count) deleted.push({ key, label: DATA_MANAGEMENT_GROUP_MAP[key].label, count });
+      continue;
+    }
+    const group = DATA_MANAGEMENT_GROUP_MAP[key];
+    if (!group || !group.collection || !Array.isArray(db[group.collection])) continue;
+    const before = db[group.collection].length;
+    if (group.collection === "attachments") {
+      db[group.collection].filter((record) => ids.has(record.id)).forEach((record) => markUploadedFileDeleted(db, record.fileUploadId || record.id));
+    }
+    if (group.collection === "expenses") {
+      db[group.collection].filter((record) => ids.has(record.id) && record.receiptFileId).forEach((record) => markUploadedFileDeleted(db, record.receiptFileId));
+    }
+    db[group.collection] = db[group.collection].filter((record) => !ids.has(record.id));
+    const count = before - db[group.collection].length;
+    if (count) deleted.push({ key, label: group.label, count });
+  }
+  return deleted;
+}
+
+function createSafetyBackupRecord(db, reason) {
+  const safetyRecord = writeBackupFile(sanitizeBackup(db), "safety");
+  db.backups.unshift(safetyRecord);
+  addActivity(db, "cleanup_safety_backup_created", "backup", safetyRecord.id, `Safety backup created before ${reason}.`, { reason });
+  return safetyRecord;
+}
+
+function clearBusinessData(db, options = {}) {
+  const defaults = {
+    keepBusinessSettings: true,
+    keepMasterData: true,
+    keepUploadedLogo: true,
+    keepBackupHistory: true,
+    keepActivityLogs: false,
+    keepRestoreLogs: false,
+    keepReminderLogs: false
+  };
+  const flags = { ...defaults, ...options };
+  const preservedSettings = { ...(db.businessSettings || defaultDb().businessSettings) };
+  const preservedMasterData = [...(db.masterData || [])];
+  const preservedBackups = [...(db.backups || [])];
+  const preservedActivity = [...(db.activityLogs || [])];
+  const preservedRestoreLogs = [...(db.restoreLogs || [])];
+  const preservedReminderLogs = [...(db.reminderLogs || [])];
+  const logoIds = [
+    preservedSettings.logoFileId,
+    preservedSettings.logoAttachmentId,
+    preservedSettings.signatureFileId,
+    preservedSettings.signatureAttachmentId
+  ].map(cleanString).filter(Boolean);
+  const preservedLogoUploads = flags.keepUploadedLogo
+    ? (db.fileUploads || []).filter((file) => logoIds.includes(file.id))
+    : [];
+
+  for (const group of DATA_MANAGEMENT_GROUPS) {
+    if (group.collection && Array.isArray(db[group.collection])) db[group.collection] = [];
+  }
+  db.orderItems = [];
+  db.invoiceItems = [];
+  db.purchaseItems = [];
+  db.fileUploads = preservedLogoUploads;
+  db.businessSettings = flags.keepBusinessSettings ? preservedSettings : defaultDb().businessSettings;
+  if (!flags.keepUploadedLogo) {
+    db.businessSettings.logoFileId = "";
+    db.businessSettings.logoAttachmentId = "";
+    db.businessSettings.logoUrl = "";
+    db.businessSettings.signatureFileId = "";
+    db.businessSettings.signatureAttachmentId = "";
+  }
+  db.masterData = flags.keepMasterData ? preservedMasterData : [];
+  db.backups = flags.keepBackupHistory ? preservedBackups : [];
+  db.activityLogs = flags.keepActivityLogs ? preservedActivity : [];
+  db.restoreLogs = flags.keepRestoreLogs ? preservedRestoreLogs : [];
+  db.reminderLogs = flags.keepReminderLogs ? preservedReminderLogs : [];
+}
+
+function entityExistsForDataManagement(db, entityType, entityId) {
+  const type = cleanString(entityType).toLowerCase();
+  const targetId = cleanString(entityId);
+  if (!type || !targetId) return false;
+  const checks = {
+    customer: () => db.customers.some((item) => item.id === targetId && isActive(item)),
+    product: () => db.products.some((item) => item.id === targetId && isActive(item)),
+    supplier: () => db.suppliers.some((item) => item.id === targetId && isActive(item)),
+    purchase: () => db.purchases.some((item) => item.id === targetId && isActive(item)),
+    invoice: () => db.invoices.some((item) => item.id === targetId && isActive(item)),
+    order: () => db.orders.some((item) => item.id === targetId && isActive(item)),
+    delivery: () => db.deliveries.some((item) => item.id === targetId && isActive(item)),
+    payment: () => db.payments.some((item) => item.id === targetId && isActive(item)),
+    expense: () => db.expenses.some((item) => item.id === targetId && isActive(item)),
+    production: () => db.productionBatches.some((item) => item.id === targetId && isActive(item)),
+    productionbatch: () => db.productionBatches.some((item) => item.id === targetId && isActive(item)),
+    inventory: () => db.inventory.some((item) => item.id === targetId && isActive(item)),
+    businesssettings: () => true
+  };
+  return checks[type] ? checks[type]() : false;
+}
+
+function detectOrphanDetails(db) {
+  const orphanGroups = [];
+  const addGroup = (key, label, records, suggestedAction) => {
+    if (records.length) orphanGroups.push({ key, label, count: records.length, suggestedAction, ids: records.map((item) => item.id), records: records.slice(0, 50).map((record) => dataRecordPreview(db, key, record)) });
+  };
+  addGroup(
+    "inventory",
+    "Inventory items with missing or archived product",
+    db.inventory.filter((item) => {
+      const product = findProduct(db, item.productId);
+      return !product || !isActive(product);
+    }),
+    "Archive or delete after confirming this stock is test data."
+  );
+  addGroup(
+    "inventoryMovements",
+    "Inventory movements with missing product",
+    (db.inventoryMovements || []).filter((item) => !findProduct(db, item.productId)),
+    "Delete only when the related product history is test data."
+  );
+  addGroup(
+    "invoiceItems",
+    "Invoice item rows with missing invoice",
+    (db.invoiceItems || []).filter((item) => !db.invoices.some((invoice) => invoice.id === item.invoiceId)),
+    "Delete orphaned derived item rows."
+  );
+  addGroup(
+    "purchaseItems",
+    "Purchase item rows with missing purchase",
+    (db.purchaseItems || []).filter((item) => !db.purchases.some((purchase) => purchase.id === item.purchaseId)),
+    "Delete orphaned derived item rows."
+  );
+  addGroup(
+    "productionMaterialUsages",
+    "Production usage rows with missing batch",
+    db.productionMaterialUsages.filter((item) => !db.productionBatches.some((batch) => batch.id === item.productionBatchId)),
+    "Archive or delete orphaned usage rows."
+  );
+  addGroup(
+    "attachments",
+    "Attachments with missing parent record",
+    db.attachments.filter((item) => !entityExistsForDataManagement(db, item.entityType, item.entityId)),
+    "Archive or delete after checking the uploaded file."
+  );
+  addGroup(
+    "notes",
+    "Notes with missing parent record",
+    db.notes.filter((item) => !entityExistsForDataManagement(db, item.entityType, item.entityId)),
+    "Archive or delete orphaned notes."
+  );
+  return orphanGroups;
+}
+
+function archiveRecordsBySelection(db, selection) {
+  const archived = [];
+  for (const [key, ids] of Object.entries(selection)) {
+    if (!ids || !ids.size) continue;
+    const group = DATA_MANAGEMENT_GROUP_MAP[key];
+    if (!group || !group.collection || !Array.isArray(db[group.collection])) continue;
+    let count = 0;
+    for (const record of db[group.collection]) {
+      if (!ids.has(record.id)) continue;
+      record.status = "ARCHIVED";
+      record.archivedAt = record.archivedAt || nowIso();
+      record.updatedAt = nowIso();
+      count += 1;
+    }
+    if (count) archived.push({ key, label: group.label, count });
+  }
+  return archived;
+}
+
+route("GET", "/api/data-management/summary", async ({ db, res }) => {
+  sendJson(res, 200, { success: true, summary: dataManagementSummary(db) });
+});
+
+route("POST", "/api/data-management/preview-cleanup", async ({ db, body, res }) => {
+  if (!requireDataCleanupEnabled(res)) return;
+  const preview = selectedCleanupPreview(db, body.selectedRecords || body.selection || {}, { includeLinkedDependencies: boolValue(body.includeLinkedDependencies, false) });
+  sendJson(res, 200, { success: true, preview, summary: dataManagementSummary(db, { includeRecords: false }) });
+});
+
+route("POST", "/api/data-management/delete-selected", async ({ db, body, res }) => {
+  if (!requireDataCleanupEnabled(res)) return;
+  if (cleanString(body.confirm) !== DELETE_SELECTED_CONFIRM_TEXT) return sendError(res, 400, `Delete selected records requires confirmation text ${DELETE_SELECTED_CONFIRM_TEXT}.`);
+  const preview = selectedCleanupPreview(db, body.selectedRecords || body.selection || {}, { includeLinkedDependencies: boolValue(body.includeLinkedDependencies, true) });
+  if (!preview.totalSelected) return sendError(res, 400, "Select at least one record to delete.");
+  const safetyBackup = boolValue(body.createBackup, true) ? createSafetyBackupRecord(db, "selected record cleanup") : null;
+  const deleted = deleteRecordsBySelection(db, normalizeSelection(preview.selection));
+  addActivity(db, "data_cleanup_selected_records", "dataManagement", "delete-selected", "Selected test records deleted.", { deleted, safetyBackupId: safetyBackup && safetyBackup.id, includeLinkedDependencies: preview.includeLinkedDependencies });
+  await saveDb(db);
+  sendJson(res, 200, { success: true, message: safetyBackup ? "A safety backup was created before cleanup." : "Selected records deleted.", deleted, safetyBackup });
+});
+
+route("POST", "/api/data-management/clear-business-data", async ({ db, body, res }) => {
+  if (!requireDataCleanupEnabled(res)) return;
+  if (cleanString(body.confirm) !== DATA_CLEANUP_CONFIRM_TEXT) return sendError(res, 400, `Clear business data requires confirmation text ${DATA_CLEANUP_CONFIRM_TEXT}.`);
+  const safetyBackup = boolValue(body.createBackup, true) ? createSafetyBackupRecord(db, "business data cleanup") : null;
+  const keepOptions = {
+    keepBusinessSettings: boolValue(body.keepBusinessSettings, true),
+    keepMasterData: boolValue(body.keepMasterData, true),
+    keepUploadedLogo: boolValue(body.keepUploadedLogo, true),
+    keepBackupHistory: boolValue(body.keepBackupHistory, true),
+    keepActivityLogs: boolValue(body.keepActivityLogs, false),
+    keepRestoreLogs: boolValue(body.keepRestoreLogs, false),
+    keepReminderLogs: boolValue(body.keepReminderLogs, false)
+  };
+  clearBusinessData(db, keepOptions);
+  if (safetyBackup && !db.backups.some((backup) => backup.id === safetyBackup.id)) db.backups.unshift(safetyBackup);
+  addActivity(db, "data_cleanup_business_cleared", "dataManagement", "clear-business-data", "Business data cleared for setup/testing cleanup.", { safetyBackupId: safetyBackup && safetyBackup.id, keepOptions });
+  await saveDb(db);
+  sendJson(res, 200, { success: true, message: "A safety backup was created before cleanup.", safetyBackup, summary: dataManagementSummary(db, { includeRecords: false }) });
+});
+
+route("GET", "/api/data-management/orphans", async ({ db, res }) => {
+  if (!requireDataCleanupEnabled(res)) return;
+  sendJson(res, 200, { success: true, orphans: detectOrphanDetails(db), summary: dataManagementSummary(db, { includeRecords: false }) });
+});
+
+route("POST", "/api/data-management/cleanup-orphans", async ({ db, body, res }) => {
+  if (!requireDataCleanupEnabled(res)) return;
+  if (cleanString(body.confirm) !== CLEAN_ORPHANS_CONFIRM_TEXT) return sendError(res, 400, `Orphan cleanup requires confirmation text ${CLEAN_ORPHANS_CONFIRM_TEXT}.`);
+  const action = cleanString(body.action || "archive").toLowerCase() === "delete" ? "delete" : "archive";
+  const orphanGroups = detectOrphanDetails(db);
+  const selection = normalizeSelection(Object.fromEntries(orphanGroups.map((group) => [group.key, group.ids])));
+  const safetyBackup = boolValue(body.createBackup, true) ? createSafetyBackupRecord(db, "orphan cleanup") : null;
+  const changed = action === "delete" ? deleteRecordsBySelection(db, selection) : archiveRecordsBySelection(db, selection);
+  addActivity(db, action === "delete" ? "data_cleanup_orphans_deleted" : "data_cleanup_orphans_archived", "dataManagement", "cleanup-orphans", `Orphaned records ${action === "delete" ? "deleted" : "archived"}.`, { changed, safetyBackupId: safetyBackup && safetyBackup.id });
+  await saveDb(db);
+  sendJson(res, 200, { success: true, message: safetyBackup ? "A safety backup was created before cleanup." : "Orphan cleanup complete.", action, changed, safetyBackup, orphans: detectOrphanDetails(db) });
+});
+
 route("POST", "/api/backup/create", async ({ db, body, res }) => {
   const requestedType = cleanString(body.backupType || body.type || "json").toLowerCase();
   if (requestedType === "zip") return sendError(res, 400, "ZIP backups are not enabled in this dependency-free local build. Create a JSON backup for business records.");

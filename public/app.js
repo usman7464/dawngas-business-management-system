@@ -505,7 +505,7 @@ function updateSidebarToggleState() {
   const drawer = isDrawerSidebar();
   const open = document.body.classList.contains("sidebar-open");
   const collapsed = state.sidebarCollapsed && !drawer;
-  const label = drawer ? "Open menu" : collapsed ? "Expand sidebar" : "Collapse sidebar";
+  const label = drawer ? "Toggle menu" : collapsed ? "Expand sidebar" : "Collapse sidebar";
   toggle.setAttribute("aria-label", label);
   toggle.setAttribute("title", label);
   toggle.setAttribute("aria-expanded", drawer ? (open ? "true" : "false") : (!collapsed ? "true" : "false"));
@@ -661,7 +661,6 @@ function renderShell() {
       <aside class="sidebar" data-sidebar>
         <div class="brand-block">
           ${sidebarBrandMarkup()}
-          <button class="icon-button sidebar-close" data-close-sidebar aria-label="Close menu"><span class="sidebar-close-icon" aria-hidden="true"></span><span class="sidebar-close-label">Close menu</span></button>
         </div>
         <nav class="nav-list">
           ${navItems.map(([key, label]) => `<button class="nav-button" data-route="${key}" title="${escapeHtml(label)}"><span class="nav-dot"></span><span class="nav-label">${escapeHtml(label)}</span></button>`).join("")}
@@ -689,7 +688,6 @@ function renderShell() {
     });
   });
   document.querySelector("[data-toggle-sidebar]").addEventListener("click", toggleSidebar);
-  document.querySelector("[data-close-sidebar]").addEventListener("click", closeSidebar);
   document.querySelector("[data-sidebar-overlay]").addEventListener("click", closeSidebar);
   if (!state.sidebarEscapeBound) {
     document.addEventListener("keydown", (event) => {
@@ -2223,7 +2221,10 @@ async function renderSettings() {
   setContent(pageShell("Settings", "Business branding used across invoices, receipts, statements, reports, and exports."));
   await loadSettings();
   await loadMasterData(true);
-  const categoryData = await api("/api/categories?includeArchived=true");
+  const [categoryData, dataManagement] = await Promise.all([
+    api("/api/categories?includeArchived=true"),
+    api("/api/data-management/summary")
+  ]);
   const s = state.settings;
   setContent(pageShell("Settings", "Business branding used across invoices, receipts, statements, reports, and exports.", "", `
     <section class="panel">
@@ -2310,6 +2311,8 @@ async function renderSettings() {
       </form>
     </section>
 
+    ${renderDataManagementSettings(dataManagement.summary)}
+
     ${renderMasterDataSettings(categoryData.categories || [])}
   `));
   document.querySelector("[data-settings-form]").addEventListener("submit", async (event) => {
@@ -2323,7 +2326,250 @@ async function renderSettings() {
   bindColorSettings();
   bindLogoSettings();
   bindSignatureSettings();
+  bindDataManagementSettings(dataManagement.summary);
   bindMasterDataSettings(categoryData.categories || []);
+}
+
+function renderDataManagementSettings(summary = {}) {
+  const countTiles = (summary.groups || [])
+    .filter((group) => group.count > 0)
+    .slice(0, 12)
+    .map((group) => `<div class="cleanup-count"><span>${escapeHtml(group.label)}</span><strong>${escapeHtml(group.count)}</strong></div>`)
+    .join("");
+  if (!summary.enabled) {
+    return `
+      <section class="panel data-management-panel" style="margin-top:14px;">
+        <div class="section-heading">
+          <div>
+            <h3>Data Management</h3>
+            <p class="page-subtitle">Cleanup tools are disabled unless explicitly enabled for production.</p>
+          </div>
+          ${badge(summary.environment || "production")}
+        </div>
+        <div class="dependency-warning">
+          <h4>Data cleanup tools are disabled in production.</h4>
+          <p>Set <code>ENABLE_DATA_CLEANUP=true</code> only for controlled maintenance when you intentionally need these tools.</p>
+        </div>
+      </section>
+    `;
+  }
+  return `
+    <section class="panel data-management-panel" style="margin-top:14px;">
+      <div class="section-heading">
+        <div>
+          <h3>Data Management</h3>
+          <p class="page-subtitle">Clean manually entered test data during setup without deleting the owner account. A safety backup is created before destructive cleanup by default.</p>
+        </div>
+        ${badge(summary.environment || "development")}
+      </div>
+      <div class="cleanup-count-grid">${countTiles || `<div class="empty compact">No business records found.</div>`}</div>
+      <div class="form-grid cleanup-toolbar">
+        ${formSelect("dataCleanupMode", "Cleanup type", [
+          { value: "selected", label: "Delete selected records" },
+          { value: "clear", label: "Clear all business data" },
+          { value: "orphans", label: "Cleanup orphaned records" }
+        ], "selected")}
+        ${formToggle("cleanupCreateBackup", "Safety backup before cleanup", true, "Recommended. Cleanup stops if backup creation fails.")}
+      </div>
+
+      <div class="data-mode-panel" data-cleanup-panel="selected">
+        <h4 class="section-mini-title">Cleanup Test Data</h4>
+        <p class="page-subtitle">Select manually entered test records, preview dependencies, then delete them after confirmation. Linked dependencies can be included so test products do not leave broken invoice, stock, or production history.</p>
+        <form data-selected-cleanup-form>
+          <div class="actions" style="margin:12px 0;">
+            ${formToggle("includeLinkedDependencies", "Include linked dependencies", true, "Recommended for test products with invoices, purchases, inventory movements, or production history.")}
+          </div>
+          <div class="cleanup-record-groups">
+            ${(summary.groups || [])
+              .filter((group) => group.records && group.records.length)
+              .map((group) => `
+                <details class="cleanup-group">
+                  <summary><span>${escapeHtml(group.label)}</span><strong>${escapeHtml(group.count)}</strong></summary>
+                  <div class="cleanup-record-list">
+                    ${group.records.map((record) => `
+                      <label class="cleanup-record">
+                        <input type="checkbox" data-cleanup-record data-group="${escapeHtml(group.key)}" value="${escapeHtml(record.id)}">
+                        <span><strong>${escapeHtml(record.label)}</strong>${record.details ? `<small>${escapeHtml(record.details)}</small>` : ""}</span>
+                      </label>
+                    `).join("")}
+                  </div>
+                </details>
+              `).join("")}
+          </div>
+          <div data-selected-cleanup-preview class="empty compact">Select records and preview dependencies before deleting.</div>
+          <div class="form-grid" style="margin-top:12px;">
+            ${formInput("deleteSelectedConfirm", `Type ${summary.deleteSelectedConfirmationText || "DELETE SELECTED RECORDS"}`, "", "text")}
+          </div>
+          <div class="actions" style="margin-top:12px;">
+            <button class="button" type="button" data-preview-selected-cleanup>Preview Dependencies</button>
+            <button class="button danger" type="submit">Delete Selected Records</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="data-mode-panel hide" data-cleanup-panel="clear">
+        <h4 class="section-mini-title">Reset Business Data</h4>
+        <div class="dependency-warning">
+          <h4>Clear business data?</h4>
+          <p>This permanently removes business records for setup/testing cleanup. Your owner login remains. A safety backup is created before cleanup.</p>
+        </div>
+        <form data-clear-business-form>
+          <div class="form-grid">
+            ${formToggle("keepBusinessSettings", "Keep business settings", true, "Preserves branding, document text, currency, and business profile.")}
+            ${formToggle("keepMasterData", "Keep master data", true, "Preserves dropdown values and item type behavior.")}
+            ${formToggle("keepUploadedLogo", "Keep uploaded logo and signature", true, "Preserves branding files referenced by settings.")}
+            ${formToggle("keepBackupHistory", "Keep backup history", true, "Preserves existing backup records plus the new safety backup.")}
+            ${formToggle("keepActivityLogs", "Keep activity logs", false, "Optional. A cleanup activity log is always created after cleanup.")}
+            ${formToggle("keepRestoreLogs", "Keep restore logs", false, "Optional maintenance history.")}
+            ${formInput("clearConfirm", `Type ${summary.confirmationText || "CLEAR BUSINESS DATA"}`, "", "text", "required")}
+          </div>
+          <div data-clear-business-preview class="cleanup-preview">
+            ${(summary.groups || []).filter((group) => group.count > 0 && !["backups", "activityLogs", "restoreLogs", "reminderLogs"].includes(group.key)).map((group) => `<div><span>${escapeHtml(group.label)}</span><strong>${escapeHtml(group.count)}</strong></div>`).join("") || `<div>No business records found.</div>`}
+          </div>
+          <div class="actions" style="margin-top:12px;">
+            <button class="button danger" type="submit">Clear Business Data</button>
+          </div>
+        </form>
+      </div>
+
+      <div class="data-mode-panel hide" data-cleanup-panel="orphans">
+        <h4 class="section-mini-title">Orphaned Records Cleanup</h4>
+        <p class="page-subtitle">Detect records such as inventory rows with missing products or notes and attachments whose parent record no longer exists.</p>
+        <form data-orphan-cleanup-form>
+          <div class="form-grid">
+            ${formSelect("orphanAction", "Action", [{ value: "archive", label: "Archive orphaned records" }, { value: "delete", label: "Delete orphaned records" }], "archive")}
+            ${formInput("orphanConfirm", `Type ${summary.orphanConfirmationText || "CLEAN ORPHANS"}`, "", "text")}
+          </div>
+          <div data-orphan-preview class="empty compact">Run detection to preview orphaned records.</div>
+          <div class="actions" style="margin-top:12px;">
+            <button class="button" type="button" data-detect-orphans>Detect Orphans</button>
+            <button class="button danger" type="submit">Cleanup Orphans</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  `;
+}
+
+function selectedCleanupRecords() {
+  const selected = {};
+  document.querySelectorAll("[data-cleanup-record]:checked").forEach((input) => {
+    selected[input.dataset.group] = selected[input.dataset.group] || [];
+    selected[input.dataset.group].push(input.value);
+  });
+  return selected;
+}
+
+function renderSelectedCleanupPreview(preview = {}) {
+  if (!preview.totalSelected) return `<div class="empty compact">No records selected.</div>`;
+  const selected = (preview.selected || []).map((group) => `<li><span>${escapeHtml(group.label)}</span><strong>${escapeHtml(group.count)}</strong></li>`).join("");
+  const dependencies = (preview.dependencies || []).length
+    ? preview.dependencies.map((item) => `
+      <div class="dependency-card">
+        <strong>${escapeHtml(item.group)}: ${escapeHtml(item.label)}</strong>
+        ${dependencySummaryHtml(item.dependencies || [])}
+      </div>
+    `).join("")
+    : `<div class="empty compact">No protected dependencies found for the current selection.</div>`;
+  return `
+    <h4 class="section-mini-title">Selected records</h4>
+    <ul class="dependency-list">${selected}</ul>
+    <h4 class="section-mini-title">Dependency summary</h4>
+    ${dependencies}
+  `;
+}
+
+function renderOrphanPreview(orphans = []) {
+  if (!orphans.length) return `<div class="empty compact">No orphaned records detected.</div>`;
+  return `
+    <div class="cleanup-preview">
+      ${orphans.map((group) => `<div><span>${escapeHtml(group.label)}<small>${escapeHtml(group.suggestedAction || "")}</small></span><strong>${escapeHtml(group.count)}</strong></div>`).join("")}
+    </div>
+  `;
+}
+
+function bindDataManagementSettings(summary = {}) {
+  if (!summary.enabled) return;
+  const modeSelect = document.querySelector("#dataCleanupMode");
+  const panels = document.querySelectorAll("[data-cleanup-panel]");
+  const backupInput = document.querySelector("#cleanupCreateBackup");
+  const createBackup = () => backupInput?.checked !== false;
+  function showMode() {
+    panels.forEach((panel) => panel.classList.toggle("hide", panel.dataset.cleanupPanel !== modeSelect.value));
+  }
+  modeSelect?.addEventListener("change", showMode);
+  showMode();
+
+  document.querySelector("[data-preview-selected-cleanup]")?.addEventListener("click", async () => {
+    const form = document.querySelector("[data-selected-cleanup-form]");
+    const values = formValues(form);
+    const preview = await api("/api/data-management/preview-cleanup", {
+      method: "POST",
+      body: {
+        selectedRecords: selectedCleanupRecords(),
+        includeLinkedDependencies: values.includeLinkedDependencies === "true"
+      }
+    });
+    document.querySelector("[data-selected-cleanup-preview]").innerHTML = renderSelectedCleanupPreview(preview.preview);
+  });
+
+  document.querySelector("[data-selected-cleanup-form]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = formValues(event.currentTarget);
+    const result = await api("/api/data-management/delete-selected", {
+      method: "POST",
+      body: {
+        selectedRecords: selectedCleanupRecords(),
+        includeLinkedDependencies: values.includeLinkedDependencies === "true",
+        createBackup: createBackup(),
+        confirm: values.deleteSelectedConfirm
+      }
+    });
+    toast(result.message || "Selected records deleted.");
+    await renderSettings();
+  });
+
+  document.querySelector("[data-clear-business-form]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = formValues(event.currentTarget);
+    const result = await api("/api/data-management/clear-business-data", {
+      method: "POST",
+      body: {
+        createBackup: createBackup(),
+        keepBusinessSettings: values.keepBusinessSettings === "true",
+        keepMasterData: values.keepMasterData === "true",
+        keepUploadedLogo: values.keepUploadedLogo === "true",
+        keepBackupHistory: values.keepBackupHistory === "true",
+        keepActivityLogs: values.keepActivityLogs === "true",
+        keepRestoreLogs: values.keepRestoreLogs === "true",
+        confirm: values.clearConfirm
+      }
+    });
+    toast(result.message || "Business data cleared.");
+    await loadMasterData(true);
+    await loadSettings();
+    await renderSettings();
+  });
+
+  document.querySelector("[data-detect-orphans]")?.addEventListener("click", async () => {
+    const result = await api("/api/data-management/orphans");
+    document.querySelector("[data-orphan-preview]").innerHTML = renderOrphanPreview(result.orphans || []);
+  });
+
+  document.querySelector("[data-orphan-cleanup-form]")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = formValues(event.currentTarget);
+    const result = await api("/api/data-management/cleanup-orphans", {
+      method: "POST",
+      body: {
+        action: values.orphanAction,
+        createBackup: createBackup(),
+        confirm: values.orphanConfirm
+      }
+    });
+    toast(result.message || "Orphan cleanup complete.");
+    document.querySelector("[data-orphan-preview]").innerHTML = renderOrphanPreview(result.orphans || []);
+  });
 }
 
 const masterDataLabels = {

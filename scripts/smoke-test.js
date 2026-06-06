@@ -500,6 +500,98 @@ function request(method, path, body, cookie = "") {
   const removeLogo = await request("DELETE", "/api/settings/logo", {}, cookie);
   if (!removeLogo.body.success || removeLogo.body.settings.logoUrl) throw new Error("Logo removal failed.");
 
+  const dataManagementSummary = await request("GET", "/api/data-management/summary", null, cookie);
+  if (!dataManagementSummary.body.success || !dataManagementSummary.body.summary.enabled || !dataManagementSummary.body.summary.groups.length) {
+    throw new Error("Data Management summary failed.");
+  }
+
+  const cleanupProduct = await request(
+    "POST",
+    "/api/products",
+    {
+      itemType: "FINISHED_PRODUCT",
+      categoryId: categoryBy("FINISHED_PRODUCT", "Stove"),
+      name: "Manual Cleanup Test Product",
+      sku: `CLEAN-${Date.now()}`,
+      unitOfMeasure: "piece",
+      costPrice: 100,
+      sellingPrice: 200,
+      openingStockQuantity: 2,
+      lowStockThreshold: 1
+    },
+    cookie
+  );
+  if (!cleanupProduct.body.success) throw new Error("Cleanup test product creation failed.");
+
+  const cleanupPreview = await request(
+    "POST",
+    "/api/data-management/preview-cleanup",
+    { selectedRecords: { products: [cleanupProduct.body.product.id] }, includeLinkedDependencies: false },
+    cookie
+  );
+  if (!cleanupPreview.body.success || !cleanupPreview.body.preview.dependencies.some((item) => item.dependencies.some((dep) => dep.type === "Inventory Movements"))) {
+    throw new Error("Data Management selected cleanup dependency preview failed.");
+  }
+
+  const cleanupSelected = await request(
+    "POST",
+    "/api/data-management/delete-selected",
+    {
+      selectedRecords: { products: [cleanupProduct.body.product.id] },
+      includeLinkedDependencies: false,
+      createBackup: true,
+      confirm: "DELETE SELECTED RECORDS"
+    },
+    cookie
+  );
+  if (!cleanupSelected.body.success || !cleanupSelected.body.safetyBackup) throw new Error("Data Management selected delete failed.");
+
+  const orphanDetection = await request("GET", "/api/data-management/orphans", null, cookie);
+  if (!orphanDetection.body.success || !orphanDetection.body.orphans.some((group) => group.key === "inventory" && group.count > 0)) {
+    throw new Error("Orphaned inventory detection failed.");
+  }
+
+  const orphanCleanup = await request(
+    "POST",
+    "/api/data-management/cleanup-orphans",
+    { action: "delete", createBackup: true, confirm: "CLEAN ORPHANS" },
+    cookie
+  );
+  if (!orphanCleanup.body.success || orphanCleanup.body.orphans.some((group) => group.key === "inventory" && group.count > 0)) {
+    throw new Error("Orphan cleanup failed.");
+  }
+
+  const clearBusinessData = await request(
+    "POST",
+    "/api/data-management/clear-business-data",
+    {
+      createBackup: true,
+      keepBusinessSettings: true,
+      keepMasterData: true,
+      keepUploadedLogo: true,
+      keepBackupHistory: true,
+      keepActivityLogs: false,
+      confirm: "CLEAR BUSINESS DATA"
+    },
+    cookie
+  );
+  if (!clearBusinessData.body.success || !clearBusinessData.body.safetyBackup) throw new Error("Clear business data failed.");
+
+  const ownerAfterCleanup = await request("GET", "/api/auth/owner-exists", null, cookie);
+  if (!ownerAfterCleanup.body.exists) throw new Error("Owner account was removed by business data cleanup.");
+
+  const settingsAfterCleanup = await request("GET", "/api/settings", null, cookie);
+  if (!settingsAfterCleanup.body.success || settingsAfterCleanup.body.settings.primaryColor !== "#13756D") throw new Error("Business settings were not preserved by cleanup.");
+
+  const masterDataAfterCleanup = await request("GET", "/api/master-data", null, cookie);
+  if (!masterDataAfterCleanup.body.success || !masterDataAfterCleanup.body.masterData.itemTypes?.length) throw new Error("Master data was not preserved by cleanup.");
+
+  const productsAfterCleanup = await request("GET", "/api/products", null, cookie);
+  if (!productsAfterCleanup.body.success || productsAfterCleanup.body.products.length) throw new Error("Business products remained after cleanup.");
+
+  const inventoryAfterCleanup = await request("GET", "/api/inventory", null, cookie);
+  if (!inventoryAfterCleanup.body.success || inventoryAfterCleanup.body.inventory.length) throw new Error("Inventory remained after cleanup.");
+
   await request("POST", "/api/auth/logout", {}, cookie);
   const protectedAfterLogout = await request("GET", "/api/dashboard/summary", null, cookie);
   if (protectedAfterLogout.status !== 401) throw new Error("Protected routes remained accessible after logout.");
