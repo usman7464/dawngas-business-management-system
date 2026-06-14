@@ -2948,7 +2948,7 @@ async function renderBackup() {
   setContent(pageShell("Backup", "Create authenticated JSON backups and restore validated backup data.", `<button class="button primary" data-create-backup>Create Backup</button>`, `
     <section class="panel backup-help">
       <h3>How backups work</h3>
-      <p class="page-subtitle">Backups export your DawnGas business records from MongoDB. JSON backups restore business records and file metadata. Uploaded physical files stay in <code>data/uploads</code> and are not embedded in JSON backups. Secrets, .env files, MongoDB passwords, and node_modules are never included.</p>
+      <p class="page-subtitle">Backups export your DawnGas business records from MongoDB. JSON backups restore business records and file metadata. Uploaded physical files remain in configured storage and are not embedded in JSON backups. Secrets, .env files, MongoDB passwords, and node_modules are never included.</p>
     </section>
     <section class="panel" style="margin-top:14px;">
       <h3>Create Backup</h3>
@@ -2956,7 +2956,7 @@ async function renderBackup() {
         ${formSelect("backupType", "Backup Type", [{ value: "json", label: "JSON Backup - business records" }, { value: "zip", label: "ZIP Backup - not enabled in local build" }], "json")}
         <div class="field">
           <label>Storage</label>
-          <input value="data/backups" disabled>
+          <input value="Configured storage" disabled>
         </div>
       </div>
       <div class="actions" style="margin-top:14px;"><button class="button primary" data-create-backup-inline>Create Backup</button></div>

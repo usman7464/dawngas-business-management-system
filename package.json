@@ -6,8 +6,16 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "dev": "node server.js",
+    "build": "node scripts/build-check.js",
+    "vercel-build": "npm run build",
+    "check": "node --check server.js && node --check public/app.js && node --check services/storageService.js && node --check api/index.js",
     "smoke": "node scripts/smoke-test.js",
+    "smoke-test": "node scripts/smoke-test.js",
+    "audit:migration": "node scripts/audit-mongodb.js",
     "migrate:json-to-mongo": "node scripts/migrate-json-to-mongodb.js",
+    "migrate:local-to-atlas": "node scripts/migrate-local-mongodb-to-atlas.js",
+    "migrate:files-to-blob": "node scripts/migrate-local-files-to-blob.js",
     "seed:demo": "node scripts/seed-demo-data.js",
     "demo:reset": "node scripts/reset-demo-data.js"
   },
@@ -15,6 +23,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@vercel/blob": "^2.4.0",
     "dotenv": "^17.4.2",
     "mongodb": "^7.2.0"
   }
