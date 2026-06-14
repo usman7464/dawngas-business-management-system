@@ -175,6 +175,22 @@ function errorState(error) {
   return `<div class="error">${escapeHtml(error.message || error)}</div>`;
 }
 
+function renderStartupLoading() {
+  app.innerHTML = `
+    <main class="auth-shell">
+      <section class="auth-panel">
+        <div class="auth-brand">DawnGas</div>
+        <h1>Loading DawnGas...</h1>
+        <p>Preparing your secure business dashboard.</p>
+      </section>
+      <section class="auth-card">
+        <h2>Starting up</h2>
+        <div class="loading">Connecting securely...</div>
+      </section>
+    </main>
+  `;
+}
+
 function renderStartupError(error) {
   console.error("DawnGas initialization failed", error);
   app.innerHTML = `
@@ -419,6 +435,7 @@ function confirmPermanentDelete(type, id) {
 }
 
 async function init() {
+  renderStartupLoading();
   try {
     const exists = await api("/api/auth/owner-exists");
     state.ownerExists = exists.exists;
