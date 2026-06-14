@@ -2337,6 +2337,7 @@ route("GET", "/api/readiness", async ({ res }) => {
     status: ready ? "ready" : "not_ready",
     environment: NODE_ENV,
     database,
+    databaseName: process.env.MONGODB_DB_NAME || "",
     storage: storage.configured ? "configured" : "not_configured",
     storageProvider: storage.provider,
     missing,

@@ -175,6 +175,25 @@ function errorState(error) {
   return `<div class="error">${escapeHtml(error.message || error)}</div>`;
 }
 
+function renderStartupError(error) {
+  console.error("DawnGas initialization failed", error);
+  app.innerHTML = `
+    <main class="auth-shell">
+      <section class="auth-panel">
+        <div class="auth-brand">${escapeHtml(state.settings?.businessName || "DawnGas")}</div>
+        <h1>DawnGas could not load.</h1>
+        <p>Please refresh or contact the administrator.</p>
+      </section>
+      <section class="auth-card">
+        <h2>Startup error</h2>
+        <div class="error">The application could not initialize safely.</div>
+        <button class="button primary" type="button" data-reload-app>Refresh</button>
+      </section>
+    </main>
+  `;
+  document.querySelector("[data-reload-app]")?.addEventListener("click", () => window.location.reload());
+}
+
 function table(headers, rows, emptyMessage = "No records yet.") {
   if (!rows || rows.length === 0) return emptyState(emptyMessage);
   return `
@@ -3217,4 +3236,4 @@ async function uploadFormFile(file, entityType, entityId = "") {
   });
 }
 
-init();
+init().catch(renderStartupError);
