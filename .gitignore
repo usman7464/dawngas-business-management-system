@@ -4,6 +4,11 @@ data/database.json
 data/*.bak
 data/backups/
 data/uploads/
+migration-backups/
+.vercel/
 .smoke-data/
 .visual-data*/
 *.log
+
+.vercel
+.env*

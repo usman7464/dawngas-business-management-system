@@ -5,6 +5,13 @@ const crypto = require("crypto");
 const { URL } = require("url");
 require("dotenv").config({ quiet: true });
 const { connectDB } = require("./server/config/db");
+const {
+  uploadBuffer,
+  uploadBackup,
+  readStoredFile,
+  storageProvider,
+  storageStatus
+} = require("./services/storageService");
 
 const PORT = Number(process.env.PORT || 3000);
 const NODE_ENV = process.env.NODE_ENV || "development";
@@ -16,6 +23,7 @@ const UPLOAD_DIR = path.resolve(__dirname, process.env.UPLOAD_STORAGE_PATH || pa
 const PUBLIC_DIR = path.join(__dirname, "public");
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 let mongoDb;
+let initializationPromise;
 
 const ENTITY_COLLECTIONS = {
   customers: "customers",
@@ -261,10 +269,12 @@ const MASTER_DATA_DEFINITIONS = {
 };
 
 function ensureDirectories() {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.mkdirSync(BACKUP_DIR, { recursive: true });
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
   fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+  if (storageProvider() === "local") {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.mkdirSync(BACKUP_DIR, { recursive: true });
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+  }
 }
 
 function nowIso() {
@@ -839,6 +849,17 @@ function sendFile(res, filePath, contentType, headers = {}) {
   if (!fs.existsSync(filePath)) return sendError(res, 404, "File not found.");
   res.writeHead(200, responseHeaders({ "Content-Type": contentType, ...headers }));
   fs.createReadStream(filePath).pipe(res);
+}
+
+async function sendStoredFile(res, record, contentType, headers = {}, options = {}) {
+  try {
+    const buffer = await readStoredFile(record, options);
+    res.writeHead(200, responseHeaders({ "Content-Type": contentType, ...headers }));
+    res.end(buffer);
+  } catch (error) {
+    if (error.statusCode === 404) return sendError(res, 404, "File not found.");
+    throw error;
+  }
 }
 
 function readBody(req) {
@@ -1978,20 +1999,24 @@ function validateBackupDocument(backup) {
   return { valid: errors.length === 0, errors, preview };
 }
 
-function writeBackupFile(backup, kind = "backup") {
+async function writeBackupFile(backup, kind = "backup") {
   const backupId = id("backup");
   const fileName = `dawngas-${kind}-${todayDate()}-${backupId}.json`;
-  const filePath = path.join(BACKUP_DIR, fileName);
-  fs.writeFileSync(filePath, JSON.stringify(backup, null, 2));
-  const stats = fs.statSync(filePath);
+  const buffer = Buffer.from(JSON.stringify(backup, null, 2));
+  const stored = await uploadBackup(buffer, fileName);
   return {
     id: backupId,
     backupType: kind === "safety" ? "SAFETY_JSON" : "FULL_JSON",
     type: "json",
     fileName,
-    filePath,
-    fileSize: stats.size,
-    size: stats.size,
+    filePath: stored.storagePath || "",
+    storagePath: stored.storagePath || "",
+    storageProvider: stored.storageProvider,
+    pathname: stored.pathname,
+    url: stored.url,
+    access: stored.access,
+    fileSize: stored.size,
+    size: stored.size,
     status: "completed",
     completedAt: nowIso(),
     metadata: backup.manifest,
@@ -2046,6 +2071,8 @@ function buildStatement(db, customerId, from = "", to = "") {
 }
 
 function getRequestOrigin(req) {
+  if (process.env.APP_BASE_URL) return cleanString(process.env.APP_BASE_URL).replace(/\/+$/, "");
+  if (process.env.VERCEL_URL) return `https://${cleanString(process.env.VERCEL_URL).replace(/\/+$/, "")}`;
   const proto = cleanString(req.headers["x-forwarded-proto"]).split(",")[0] || (req.socket && req.socket.encrypted ? "https" : "http");
   const host = cleanString(req.headers["x-forwarded-host"]).split(",")[0] || cleanString(req.headers.host) || `localhost:${PORT}`;
   return `${proto}://${host}`;
@@ -2223,7 +2250,7 @@ function sharedPdfDocument(db, link) {
 
 const routes = [];
 function route(method, pattern, handler, options = {}) {
-  routes.push({ method, pattern, handler, auth: options.auth !== false });
+  routes.push({ method, pattern, handler, auth: options.auth !== false, db: options.db !== false });
 }
 
 function matchRoute(method, pathname) {
@@ -2277,8 +2304,46 @@ function listQuery(records, query, searchable = []) {
 }
 
 route("GET", "/api/health", async ({ res }) => {
-  sendJson(res, 200, { success: true, message: "DawnGas API is running.", timestamp: nowIso() });
-}, { auth: false });
+  sendJson(res, 200, {
+    success: true,
+    status: "ok",
+    environment: NODE_ENV,
+    message: "DawnGas API is running.",
+    timestamp: nowIso()
+  });
+}, { auth: false, db: false });
+
+route("GET", "/api/readiness", async ({ res }) => {
+  const missing = [];
+  if (!process.env.MONGODB_URI) missing.push("MONGODB_URI");
+  if (!process.env.MONGODB_DB_NAME) missing.push("MONGODB_DB_NAME");
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET === "replace_with_secure_secret") missing.push("JWT_SECRET");
+  const storage = storageStatus();
+  if (!storage.configured) missing.push(storage.provider === "vercel_blob" ? "BLOB_READ_WRITE_TOKEN" : "STORAGE_PROVIDER");
+
+  let database = "disconnected";
+  let dbError = "";
+  try {
+    await initializeApp();
+    await mongoDb.command({ ping: 1 });
+    database = "connected";
+  } catch (error) {
+    dbError = NODE_ENV === "production" ? "Database readiness check failed." : error.message;
+  }
+
+  const ready = database === "connected" && storage.configured && missing.length === 0;
+  sendJson(res, ready ? 200 : 503, {
+    success: ready,
+    status: ready ? "ready" : "not_ready",
+    environment: NODE_ENV,
+    database,
+    storage: storage.configured ? "configured" : "not_configured",
+    storageProvider: storage.provider,
+    missing,
+    message: ready ? "Application is ready." : "Application is not ready.",
+    ...(dbError ? { databaseMessage: dbError } : {})
+  });
+}, { auth: false, db: false });
 
 route("GET", "/api/auth/owner-exists", async ({ db, res }) => {
   sendJson(res, 200, { success: true, exists: db.users.length > 0 });
@@ -4893,17 +4958,19 @@ route("POST", "/api/settings/logo", async ({ db, body, res }) => {
 
   const fileId = id("file");
   const safeName = cleanString(body.fileName).replace(/[^a-zA-Z0-9._-]/g, "_");
-  const extension = path.extname(safeName) || (mimeType === "image/png" ? ".png" : mimeType === "image/webp" ? ".webp" : mimeType === "image/svg+xml" ? ".svg" : ".jpg");
-  const storedName = `${fileId}${extension}`;
-  const storagePath = path.join(UPLOAD_DIR, storedName);
-  fs.writeFileSync(storagePath, buffer);
+  const stored = await uploadBuffer({ buffer, fileId, fileName: safeName, mimeType, prefix: "logos", access: "public" });
   const upload = {
     id: fileId,
     originalName: safeName,
-    fileName: storedName,
+    fileName: stored.fileName,
     mimeType,
     size: buffer.byteLength,
-    storagePath,
+    storagePath: stored.storagePath,
+    storageProvider: stored.storageProvider,
+    pathname: stored.pathname,
+    url: stored.url,
+    access: stored.access,
+    uploadedAt: stored.uploadedAt,
     entityType: "businessSettings",
     entityId: "business",
     deletedAt: null,
@@ -4946,17 +5013,19 @@ route("POST", "/api/settings/signature", async ({ db, body, res }) => {
   if (buffer.byteLength > 5 * 1024 * 1024) return sendError(res, 413, "Signature must be 5 MB or smaller.");
   const fileId = id("file");
   const safeName = cleanString(body.fileName).replace(/[^a-zA-Z0-9._-]/g, "_");
-  const extension = path.extname(safeName) || ".png";
-  const storedName = `${fileId}${extension}`;
-  const storagePath = path.join(UPLOAD_DIR, storedName);
-  fs.writeFileSync(storagePath, buffer);
+  const stored = await uploadBuffer({ buffer, fileId, fileName: safeName, mimeType, prefix: "signatures", access: "private" });
   const upload = {
     id: fileId,
     originalName: safeName,
-    fileName: storedName,
+    fileName: stored.fileName,
     mimeType,
     size: buffer.byteLength,
-    storagePath,
+    storagePath: stored.storagePath,
+    storageProvider: stored.storageProvider,
+    pathname: stored.pathname,
+    url: stored.url,
+    access: stored.access,
+    uploadedAt: stored.uploadedAt,
     entityType: "businessSettings",
     entityId: "signature",
     deletedAt: null,
@@ -5097,17 +5166,19 @@ route("POST", "/api/attachments", async ({ db, body, res }) => {
   if (buffer.byteLength > maxSize) return sendError(res, 413, "Attachment is too large.");
   const attachmentId = id("file");
   const safeName = cleanString(body.fileName).replace(/[^a-zA-Z0-9._-]/g, "_");
-  const extension = path.extname(safeName) || "";
-  const storedName = `${attachmentId}${extension}`;
-  const storagePath = path.join(UPLOAD_DIR, storedName);
-  fs.writeFileSync(storagePath, buffer);
+  const stored = await uploadBuffer({ buffer, fileId: attachmentId, fileName: safeName, mimeType, prefix: "attachments", access: "private" });
   const fileUpload = {
     id: attachmentId,
     originalName: safeName,
-    fileName: storedName,
+    fileName: stored.fileName,
     mimeType,
     size: buffer.byteLength,
-    storagePath,
+    storagePath: stored.storagePath,
+    storageProvider: stored.storageProvider,
+    pathname: stored.pathname,
+    url: stored.url,
+    access: stored.access,
+    uploadedAt: stored.uploadedAt,
     entityType: cleanString(body.entityType),
     entityId: cleanString(body.entityId),
     deletedAt: null,
@@ -5124,7 +5195,11 @@ route("POST", "/api/attachments", async ({ db, body, res }) => {
     fileName: safeName,
     mimeType,
     size: buffer.byteLength,
-    storageName: storedName,
+    storageName: stored.fileName,
+    storageProvider: stored.storageProvider,
+    pathname: stored.pathname,
+    url: stored.url,
+    access: stored.access,
     createdAt: nowIso(),
     updatedAt: nowIso(),
     archivedAt: null
@@ -5139,8 +5214,8 @@ route("POST", "/api/attachments", async ({ db, body, res }) => {
 route("GET", "/api/attachments/:id/download", async ({ db, params, res }) => {
   const attachment = db.attachments.find((item) => item.id === params.id && isActive(item));
   if (!attachment) return sendError(res, 404, "Attachment not found.");
-  const filePath = path.join(UPLOAD_DIR, attachment.storageName);
-  sendFile(res, filePath, attachment.mimeType, { "Content-Disposition": `attachment; filename="${attachment.fileName}"` });
+  const file = db.fileUploads.find((item) => item.id === (attachment.fileUploadId || attachment.id)) || attachment;
+  await sendStoredFile(res, file, attachment.mimeType, { "Content-Disposition": `attachment; filename="${attachment.fileName}"` });
 });
 
 route("GET", "/api/attachments/:entityType/:entityId", async ({ db, params, res }) => {
@@ -5148,12 +5223,13 @@ route("GET", "/api/attachments/:entityType/:entityId", async ({ db, params, res 
   sendJson(res, 200, { success: true, attachments });
 });
 
-route("GET", "/api/uploads/:fileId", async ({ db, params, res }) => {
+route("GET", "/api/uploads/:fileId", async ({ db, params, current, res }) => {
   const file = db.fileUploads.find((item) => item.id === params.fileId && !item.deletedAt);
   if (!file) return sendError(res, 404, "File not found.");
-  const filePath = path.join(UPLOAD_DIR, file.fileName);
-  sendFile(res, filePath, file.mimeType, { "Cache-Control": "private, max-age=300" });
-});
+  const isPublicBrandAsset = file.entityType === "businessSettings" && file.entityId === "business";
+  if (!isPublicBrandAsset && !current) return sendError(res, 401, "Authentication required.");
+  await sendStoredFile(res, file, file.mimeType, { "Cache-Control": isPublicBrandAsset ? "public, max-age=3600" : "private, max-age=300" });
+}, { auth: false });
 
 route("POST", "/api/uploads", async ({ db, body, res }) => {
   const errors = requireFields(body, ["fileName", "mimeType", "data"]);
@@ -5166,16 +5242,19 @@ route("POST", "/api/uploads", async ({ db, body, res }) => {
   if (buffer.byteLength > 10 * 1024 * 1024) return sendError(res, 413, "File is too large.");
   const fileId = id("file");
   const safeName = cleanString(body.fileName).replace(/[^a-zA-Z0-9._-]/g, "_");
-  const storedName = `${fileId}${path.extname(safeName) || ""}`;
-  const storagePath = path.join(UPLOAD_DIR, storedName);
-  fs.writeFileSync(storagePath, buffer);
+  const stored = await uploadBuffer({ buffer, fileId, fileName: safeName, mimeType, prefix: "uploads", access: "private" });
   const upload = {
     id: fileId,
     originalName: safeName,
-    fileName: storedName,
+    fileName: stored.fileName,
     mimeType,
     size: buffer.byteLength,
-    storagePath,
+    storagePath: stored.storagePath,
+    storageProvider: stored.storageProvider,
+    pathname: stored.pathname,
+    url: stored.url,
+    access: stored.access,
+    uploadedAt: stored.uploadedAt,
     entityType: cleanString(body.entityType),
     entityId: cleanString(body.entityId),
     deletedAt: null,
@@ -5741,8 +5820,8 @@ function deleteRecordsBySelection(db, selection) {
   return deleted;
 }
 
-function createSafetyBackupRecord(db, reason) {
-  const safetyRecord = writeBackupFile(sanitizeBackup(db), "safety");
+async function createSafetyBackupRecord(db, reason) {
+  const safetyRecord = await writeBackupFile(sanitizeBackup(db), "safety");
   db.backups.unshift(safetyRecord);
   addActivity(db, "cleanup_safety_backup_created", "backup", safetyRecord.id, `Safety backup created before ${reason}.`, { reason });
   return safetyRecord;
@@ -5906,7 +5985,7 @@ route("POST", "/api/data-management/delete-selected", async ({ db, body, res }) 
   if (cleanString(body.confirm) !== DELETE_SELECTED_CONFIRM_TEXT) return sendError(res, 400, `Delete selected records requires confirmation text ${DELETE_SELECTED_CONFIRM_TEXT}.`);
   const preview = selectedCleanupPreview(db, body.selectedRecords || body.selection || {}, { includeLinkedDependencies: boolValue(body.includeLinkedDependencies, true) });
   if (!preview.totalSelected) return sendError(res, 400, "Select at least one record to delete.");
-  const safetyBackup = boolValue(body.createBackup, true) ? createSafetyBackupRecord(db, "selected record cleanup") : null;
+  const safetyBackup = boolValue(body.createBackup, true) ? await createSafetyBackupRecord(db, "selected record cleanup") : null;
   const deleted = deleteRecordsBySelection(db, normalizeSelection(preview.selection));
   addActivity(db, "data_cleanup_selected_records", "dataManagement", "delete-selected", "Selected test records deleted.", { deleted, safetyBackupId: safetyBackup && safetyBackup.id, includeLinkedDependencies: preview.includeLinkedDependencies });
   await saveDb(db);
@@ -5916,7 +5995,7 @@ route("POST", "/api/data-management/delete-selected", async ({ db, body, res }) 
 route("POST", "/api/data-management/clear-business-data", async ({ db, body, res }) => {
   if (!requireDataCleanupEnabled(res)) return;
   if (cleanString(body.confirm) !== DATA_CLEANUP_CONFIRM_TEXT) return sendError(res, 400, `Clear business data requires confirmation text ${DATA_CLEANUP_CONFIRM_TEXT}.`);
-  const safetyBackup = boolValue(body.createBackup, true) ? createSafetyBackupRecord(db, "business data cleanup") : null;
+  const safetyBackup = boolValue(body.createBackup, true) ? await createSafetyBackupRecord(db, "business data cleanup") : null;
   const keepOptions = {
     keepBusinessSettings: boolValue(body.keepBusinessSettings, true),
     keepMasterData: boolValue(body.keepMasterData, true),
@@ -5944,7 +6023,7 @@ route("POST", "/api/data-management/cleanup-orphans", async ({ db, body, res }) 
   const action = cleanString(body.action || "archive").toLowerCase() === "delete" ? "delete" : "archive";
   const orphanGroups = detectOrphanDetails(db);
   const selection = normalizeSelection(Object.fromEntries(orphanGroups.map((group) => [group.key, group.ids])));
-  const safetyBackup = boolValue(body.createBackup, true) ? createSafetyBackupRecord(db, "orphan cleanup") : null;
+  const safetyBackup = boolValue(body.createBackup, true) ? await createSafetyBackupRecord(db, "orphan cleanup") : null;
   const changed = action === "delete" ? deleteRecordsBySelection(db, selection) : archiveRecordsBySelection(db, selection);
   addActivity(db, action === "delete" ? "data_cleanup_orphans_deleted" : "data_cleanup_orphans_archived", "dataManagement", "cleanup-orphans", `Orphaned records ${action === "delete" ? "deleted" : "archived"}.`, { changed, safetyBackupId: safetyBackup && safetyBackup.id });
   await saveDb(db);
@@ -5955,7 +6034,7 @@ route("POST", "/api/backup/create", async ({ db, body, res }) => {
   const requestedType = cleanString(body.backupType || body.type || "json").toLowerCase();
   if (requestedType === "zip") return sendError(res, 400, "ZIP backups are not enabled in this dependency-free local build. Create a JSON backup for business records.");
   const backup = sanitizeBackup(db);
-  const record = writeBackupFile(backup, "backup");
+  const record = await writeBackupFile(backup, "backup");
   db.backups.unshift(record);
   addNotification(db, "backup_completed", "Backup completed", `${record.fileName} is ready to download.`, "backup", record.id);
   addActivity(db, "backup_created", "backup", record.id, "JSON backup created.");
@@ -5974,13 +6053,13 @@ route("GET", "/api/backup/history", async ({ db, res }) => {
 route("GET", "/api/backup/:id/download", async ({ db, params, res }) => {
   const backup = db.backups.find((item) => item.id === params.id);
   if (!backup) return sendError(res, 404, "Backup not found.");
-  sendFile(res, path.join(BACKUP_DIR, backup.fileName), "application/json; charset=utf-8", { "Content-Disposition": `attachment; filename="${backup.fileName}"` });
+  await sendStoredFile(res, backup, "application/json; charset=utf-8", { "Content-Disposition": `attachment; filename="${backup.fileName}"` }, { kind: "backup" });
 });
 
 route("GET", "/api/backup/download/:id", async ({ db, params, res }) => {
   const backup = db.backups.find((item) => item.id === params.id && !item.deletedAt);
   if (!backup) return sendError(res, 404, "Backup not found.");
-  sendFile(res, path.join(BACKUP_DIR, backup.fileName), "application/json; charset=utf-8", { "Content-Disposition": `attachment; filename="${backup.fileName}"` });
+  await sendStoredFile(res, backup, "application/json; charset=utf-8", { "Content-Disposition": `attachment; filename="${backup.fileName}"` }, { kind: "backup" });
 });
 
 route("DELETE", "/api/backup/:id", async ({ db, params, res }) => {
@@ -6002,7 +6081,7 @@ route("POST", "/api/backup/restore", async ({ db, body, res }) => {
   const backup = body.backup;
   const validation = validateBackupDocument(backup);
   if (!validation.valid) return sendJson(res, 400, { success: false, message: "Invalid DawnGas backup file.", errors: validation.errors, preview: validation.preview });
-  const safetyRecord = writeBackupFile(sanitizeBackup(db), "safety");
+  const safetyRecord = await writeBackupFile(sanitizeBackup(db), "safety");
   const preservedUsers = db.users;
   const preservedSessions = db.sessions;
   const restored = normalizeDb(backup.data);
@@ -6182,7 +6261,6 @@ function serveStatic(req, res, pathname) {
 }
 
 async function handleRequest(req, res) {
-  const db = await loadDb();
   const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   if (req.method === "OPTIONS") {
     res.writeHead(204, responseHeaders({ "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS", "Access-Control-Allow-Headers": "Content-Type" }));
@@ -6191,13 +6269,18 @@ async function handleRequest(req, res) {
   if (!parsedUrl.pathname.startsWith("/api/")) return serveStatic(req, res, parsedUrl.pathname);
   const matched = matchRoute(req.method, parsedUrl.pathname);
   if (!matched) return sendError(res, 404, "API route not found.");
+  let db = null;
+  if (matched.db) {
+    await initializeApp();
+    db = await loadDb();
+  }
   let body = {};
   try {
     if (["POST", "PATCH", "DELETE"].includes(req.method)) body = await readBody(req);
   } catch (error) {
     return sendError(res, error.statusCode || 400, error.message);
   }
-  const current = getSession(req, db);
+  const current = db ? getSession(req, db) : null;
   if (matched.auth && !current) return sendError(res, 401, "Authentication required.");
   try {
     await matched.handler({
@@ -6215,28 +6298,46 @@ async function handleRequest(req, res) {
   }
 }
 
+async function initializeApp() {
+  if (initializationPromise) return initializationPromise;
+  initializationPromise = (async () => {
+    ensureDirectories();
+    mongoDb = await connectDB();
+    await ensureMongoIndexes();
+    await seedDefaultCategories();
+    await seedDefaultMasterData();
+    await migrateLegacyInventoryMovements();
+    const existingSettings = await mongoDb.collection(SINGLETON_COLLECTIONS.businessSettings).findOne({ id: "business" });
+    if (!existingSettings) {
+      await mongoDb.collection(SINGLETON_COLLECTIONS.businessSettings).insertOne({ ...defaultDb().businessSettings, id: "business" });
+    }
+    const existingPreferences = await mongoDb.collection(SINGLETON_COLLECTIONS.dashboardPreferences).findOne({ id: "dashboard" });
+    if (!existingPreferences) {
+      await mongoDb.collection(SINGLETON_COLLECTIONS.dashboardPreferences).insertOne({ ...defaultDb().dashboardPreferences, id: "dashboard" });
+    }
+    return mongoDb;
+  })().catch((error) => {
+    initializationPromise = null;
+    throw error;
+  });
+  return initializationPromise;
+}
+
 async function startServer() {
-  ensureDirectories();
-  mongoDb = await connectDB();
-  await ensureMongoIndexes();
-  await seedDefaultCategories();
-  await seedDefaultMasterData();
-  await migrateLegacyInventoryMovements();
-  const existingSettings = await mongoDb.collection(SINGLETON_COLLECTIONS.businessSettings).findOne({ id: "business" });
-  if (!existingSettings) {
-    await mongoDb.collection(SINGLETON_COLLECTIONS.businessSettings).insertOne({ ...defaultDb().businessSettings, id: "business" });
-  }
-  const existingPreferences = await mongoDb.collection(SINGLETON_COLLECTIONS.dashboardPreferences).findOne({ id: "dashboard" });
-  if (!existingPreferences) {
-    await mongoDb.collection(SINGLETON_COLLECTIONS.dashboardPreferences).insertOne({ ...defaultDb().dashboardPreferences, id: "dashboard" });
-  }
+  await initializeApp();
   const server = http.createServer(handleRequest);
   server.listen(PORT, () => {
     console.log(`DawnGas is running at http://localhost:${PORT}`);
   });
 }
 
-startServer().catch((error) => {
-  console.error(`Failed to start DawnGas: ${error.message}`);
-  process.exit(1);
-});
+if (require.main === module) {
+  startServer().catch((error) => {
+    console.error(`Failed to start DawnGas: ${error.message}`);
+    process.exit(1);
+  });
+}
+
+module.exports = handleRequest;
+module.exports.handleRequest = handleRequest;
+module.exports.initializeApp = initializeApp;

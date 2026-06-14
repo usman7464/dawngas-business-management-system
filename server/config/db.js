@@ -1,7 +1,14 @@
 const { MongoClient } = require("mongodb");
 
-let client;
-let database;
+const mongoCache = global.__dawngasMongoCache || {
+  client: null,
+  database: null,
+  promise: null,
+  uri: null,
+  dbName: null
+};
+
+global.__dawngasMongoCache = mongoCache;
 
 async function connectDB() {
   const uri = process.env.MONGODB_URI;
@@ -11,24 +18,43 @@ async function connectDB() {
     throw new Error("MONGODB_URI is required. Add it to your .env file.");
   }
 
-  client = new MongoClient(uri);
-  await client.connect();
-  database = client.db(dbName);
+  if (mongoCache.database && mongoCache.uri === uri && mongoCache.dbName === dbName) {
+    return mongoCache.database;
+  }
+
+  if (!mongoCache.promise || mongoCache.uri !== uri || mongoCache.dbName !== dbName) {
+    mongoCache.uri = uri;
+    mongoCache.dbName = dbName;
+    mongoCache.client = new MongoClient(uri, {
+      maxPoolSize: Number(process.env.MONGODB_MAX_POOL_SIZE || 10),
+      serverSelectionTimeoutMS: Number(process.env.MONGODB_SERVER_SELECTION_TIMEOUT_MS || 10000),
+      connectTimeoutMS: Number(process.env.MONGODB_CONNECT_TIMEOUT_MS || 10000)
+    });
+    mongoCache.promise = mongoCache.client.connect();
+  }
+
+  await mongoCache.promise;
+  mongoCache.database = mongoCache.client.db(dbName);
   console.log(`MongoDB connected. Database: ${dbName}`);
-  return database;
+  return mongoCache.database;
 }
 
 function getDB() {
-  if (!database) {
+  if (!mongoCache.database) {
     throw new Error("MongoDB has not been connected yet.");
   }
-  return database;
+  return mongoCache.database;
 }
 
 async function closeDB() {
-  if (client) {
-    await client.close();
+  if (mongoCache.client) {
+    await mongoCache.client.close();
   }
+  mongoCache.client = null;
+  mongoCache.database = null;
+  mongoCache.promise = null;
+  mongoCache.uri = null;
+  mongoCache.dbName = null;
 }
 
 module.exports = {

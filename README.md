@@ -1,59 +1,44 @@
 # DawnGas Business Management System
 
-Owner-only business management dashboard for DawnGas. The app manages products, raw materials, spare parts, services, inventory, purchases, production, invoices, payments, reports, backups, and branded document sharing.
+Owner-only business management dashboard for DawnGas. It manages products, raw materials, spare parts, services, inventory, purchases, production, invoices, payments, reports, backups, uploads, and branded document sharing.
 
-## Tech Stack
+## Stack
 
 - Node.js 20+
-- MongoDB
+- MongoDB locally, MongoDB Atlas in production
+- Vercel Functions for the HTTP backend
+- Vercel Blob for production file and backup storage
 - Vanilla JavaScript, HTML, and CSS
-- Dependency-light HTTP server in `server.js`
 
-## Run Locally
+## Local Development
 
-1. Start MongoDB locally.
-2. Copy `.env.example` to `.env` if needed and adjust values.
+1. Start local MongoDB.
+2. Copy `.env.example` to `.env` and keep `STORAGE_PROVIDER=local`.
 3. Install dependencies:
 
 ```powershell
-npm install
+npm.cmd install
 ```
 
 4. Start the app:
 
 ```powershell
-npm run start
+npm.cmd run start
 ```
 
-5. Open:
-
-```text
-http://localhost:5000
-```
+5. Open `http://localhost:5000`.
 
 ## Useful Commands
 
 ```powershell
-npm run smoke
-npm run seed:demo
-npm run demo:reset
+npm.cmd run check
+npm.cmd run build
+npm.cmd run audit:migration
+npm.cmd run smoke-test
+npm.cmd run migrate:local-to-atlas
+npm.cmd run migrate:files-to-blob
 ```
 
-If you run the smoke test against the configured local port:
+## Production
 
-```powershell
-$env:PORT="5000"
-npm run smoke
-```
-
-## Important Environment Variables
-
-- `PORT`
-- `MONGODB_URI`
-- `MONGODB_DB_NAME`
-- `JWT_SECRET`
-- `BACKUP_STORAGE_PATH`
-- `UPLOAD_STORAGE_PATH`
-
-
-
+Production deployment uses Vercel, MongoDB Atlas, and Vercel Blob. See [DEPLOYMENT.md](DEPLOYMENT.md) for the full workflow and [ROLLBACK.md](ROLLBACK.md) for recovery steps.
