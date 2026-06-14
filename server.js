@@ -12,6 +12,10 @@ const {
   storageProvider,
   storageStatus
 } = require("./services/storageService");
+const {
+  emailStatus,
+  sendPasswordResetEmail
+} = require("./services/emailService");
 
 const PORT = Number(process.env.PORT || 3000);
 const NODE_ENV = process.env.NODE_ENV || "development";
@@ -77,7 +81,8 @@ const MONGO_COLLECTIONS = {
   restoreLogs: "restorelogs",
   reminderLogs: "reminderlogs",
   masterData: "masterdata",
-  shareLinks: "sharelinks"
+  shareLinks: "sharelinks",
+  emailLogs: "emaillogs"
 };
 
 const SINGLETON_COLLECTIONS = {
@@ -331,6 +336,7 @@ function defaultDb() {
     reminderLogs: [],
     masterData: [],
     shareLinks: [],
+    emailLogs: [],
     businessSettings: {
       id: "business",
       businessName: "DawnGas",
@@ -363,6 +369,11 @@ function defaultDb() {
       terms: "Payment is due according to the agreed customer terms.",
       invoiceTerms: "Payment is due according to the agreed customer terms.",
       paymentInstructions: "Please pay the outstanding balance using the agreed payment method.",
+      emailEnabled: false,
+      emailProvider: "resend",
+      emailFromName: "DawnGas",
+      emailFromEmail: "",
+      emailReplyTo: "",
       lowStockThreshold: 5,
       whatsappSharingEnabled: true,
       sidebarBrandMode: "logo_only",
@@ -559,6 +570,7 @@ async function ensureMongoIndexes() {
   await mongoDb.collection("masterdata").createIndex({ type: 1, status: 1, sortOrder: 1 });
   await mongoDb.collection("sharelinks").createIndex({ tokenHash: 1 }, { unique: true, sparse: true });
   await mongoDb.collection("sharelinks").createIndex({ entityType: 1, entityId: 1, expiresAt: 1 });
+  await mongoDb.collection("emaillogs").createIndex({ entityType: 1, entityId: 1, createdAt: -1 });
   await mongoDb.collection("businesssettings").createIndex({ id: 1 }, { unique: true });
   await mongoDb.collection("dashboardpreferences").createIndex({ id: 1 }, { unique: true });
 }
@@ -925,6 +937,56 @@ function getSession(req, db) {
   const user = db.users.find((item) => item.id === session.userId && item.status === "active");
   if (!user) return null;
   return { session, user };
+}
+
+async function directDb() {
+  if (!mongoDb) mongoDb = await connectDB();
+  return mongoDb;
+}
+
+async function getCurrentFromMongo(req) {
+  const cookies = parseCookies(req);
+  const cookie = cookies.dawngas_session;
+  if (!cookie || !cookie.includes(".")) return null;
+  const [token, signature] = cookie.split(".");
+  if (!timingSafeEqual(signValue(token), signature)) return null;
+  const database = await directDb();
+  const session = cleanMongoDoc(await database.collection(MONGO_COLLECTIONS.sessions).findOne({ tokenHash: hashValue(token) }));
+  if (!session || session.revokedAt || new Date(session.expiresAt).getTime() < Date.now()) return null;
+  const user = cleanMongoDoc(await database.collection(MONGO_COLLECTIONS.users).findOne({ id: session.userId, status: "active" }));
+  if (!user) return null;
+  return { session, user };
+}
+
+async function insertActivityLog(action, entityType, entityId, description, metadata = {}) {
+  const database = await directDb();
+  await database.collection(MONGO_COLLECTIONS.activityLogs).insertOne({
+    id: id("log"),
+    action,
+    entityType,
+    entityId,
+    description,
+    metadata,
+    createdAt: nowIso()
+  });
+}
+
+async function insertEmailLog({ entityType, entityId, recipient, subject, provider = "resend", providerMessageId = "", status, errorMessage = "" }) {
+  const database = await directDb();
+  await database.collection(MONGO_COLLECTIONS.emailLogs).insertOne({
+    id: id("email"),
+    entityType,
+    entityId,
+    recipient,
+    subject,
+    provider,
+    providerMessageId,
+    status,
+    errorMessage,
+    sentAt: status === "SENT" ? nowIso() : null,
+    createdAt: nowIso(),
+    updatedAt: nowIso()
+  });
 }
 
 function createSession(res, db, user) {
@@ -2320,6 +2382,11 @@ route("GET", "/api/readiness", async ({ res }) => {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET === "replace_with_secure_secret") missing.push("JWT_SECRET");
   const storage = storageStatus();
   if (!storage.configured) missing.push(storage.provider === "vercel_blob" ? "BLOB_READ_WRITE_TOKEN" : "STORAGE_PROVIDER");
+  const email = emailStatus();
+  if (email.enabled && !email.configured) {
+    if (!email.apiKeyPresent) missing.push("RESEND_API_KEY");
+    if (!email.fromEmailPresent) missing.push("RESEND_FROM_EMAIL");
+  }
 
   let database = "disconnected";
   let dbError = "";
@@ -2340,15 +2407,21 @@ route("GET", "/api/readiness", async ({ res }) => {
     databaseName: process.env.MONGODB_DB_NAME || "",
     storage: storage.configured ? "configured" : "not_configured",
     storageProvider: storage.provider,
+    email: email.configured ? "configured" : email.enabled ? "not_configured" : "disabled",
+    pdf: "ready",
+    jsonBackup: "ready",
+    zipBackup: "not_configured",
     missing,
     message: ready ? "Application is ready." : "Application is not ready.",
     ...(dbError ? { databaseMessage: dbError } : {})
   });
 }, { auth: false, db: false });
 
-route("GET", "/api/auth/owner-exists", async ({ db, res }) => {
-  sendJson(res, 200, { success: true, exists: db.users.length > 0 });
-}, { auth: false });
+route("GET", "/api/auth/owner-exists", async ({ res }) => {
+  const database = await directDb();
+  const owners = await database.collection(MONGO_COLLECTIONS.users).countDocuments({});
+  sendJson(res, 200, { success: true, exists: owners > 0 });
+}, { auth: false, db: false });
 
 route("POST", "/api/auth/signup", async ({ req, db, body, res }) => {
   if (!rateLimit(req, "signup", 5, 15 * 60 * 1000)) return sendError(res, 429, "Too many signup attempts. Please try again later.");
@@ -2395,9 +2468,11 @@ route("POST", "/api/auth/logout", async ({ req, db, res }) => {
   sendJson(res, 200, { success: true, message: "Logged out." });
 }, { auth: false });
 
-route("GET", "/api/auth/me", async ({ current, res }) => {
+route("GET", "/api/auth/me", async ({ req, res }) => {
+  const current = await getCurrentFromMongo(req);
+  if (!current) return sendError(res, 401, "Authentication required.");
   sendJson(res, 200, { success: true, user: publicUser(current.user) });
-});
+}, { auth: false, db: false });
 
 route("POST", "/api/share-links", async ({ req, db, body, current, res }) => {
   const entityType = cleanString(body.entityType).toLowerCase();
@@ -2463,31 +2538,65 @@ route("GET", "/api/share/:token/pdf", async ({ db, params, res }) => {
   sendPdf(res, document.title, document.lines, document.fileName, db);
 }, { auth: false });
 
-route("POST", "/api/auth/forgot-password", async ({ req, db, body, res }) => {
+route("POST", "/api/auth/forgot-password", async ({ req, body, res }) => {
   if (!rateLimit(req, "forgot-password", 5, 15 * 60 * 1000)) return sendError(res, 429, "Too many reset requests. Please try again later.");
   const email = cleanString(body.email).toLowerCase();
-  const user = db.users.find((item) => item.email === email);
+  const database = await directDb();
+  const user = cleanMongoDoc(await database.collection(MONGO_COLLECTIONS.users).findOne({ email }));
   let devResetToken = "";
   if (user) {
     const token = crypto.randomBytes(24).toString("hex");
-    db.passwordResetTokens.push({
+    const reset = {
       id: id("reset"),
       userId: user.id,
       tokenHash: hashValue(token),
       createdAt: nowIso(),
       expiresAt: new Date(Date.now() + 1000 * 60 * 30).toISOString(),
       usedAt: null
-    });
-    addActivity(db, "password_reset_requested", "owner", user.id, "Password reset requested.");
+    };
+    await database.collection(MONGO_COLLECTIONS.passwordResetTokens).insertOne(reset);
+    await insertActivityLog("password_reset_requested", "owner", user.id, "Password reset requested.");
     if (NODE_ENV !== "production") devResetToken = token;
-    await saveDb(db);
+    const settings = cleanMongoDoc(await database.collection(SINGLETON_COLLECTIONS.businessSettings).findOne({ id: "business" })) || defaultDb().businessSettings;
+    const branding = getBranding({ businessSettings: settings });
+    const resetUrl = new URL("/", getRequestOrigin(req));
+    resetUrl.searchParams.set("resetToken", token);
+    const subject = `${branding.businessName || "DawnGas"} password reset`;
+    try {
+      const result = await sendPasswordResetEmail({
+        to: user.email,
+        ownerName: user.name,
+        businessName: branding.businessName,
+        resetUrl: resetUrl.toString(),
+        settings: branding
+      });
+      await insertEmailLog({
+        entityType: "owner",
+        entityId: user.id,
+        recipient: user.email,
+        subject,
+        provider: result.provider,
+        providerMessageId: result.providerMessageId,
+        status: "SENT"
+      });
+    } catch (error) {
+      await insertEmailLog({
+        entityType: "owner",
+        entityId: user.id,
+        recipient: user.email,
+        subject,
+        provider: "resend",
+        status: "FAILED",
+        errorMessage: error.code === "EMAIL_NOT_CONFIGURED" ? "Email service is not configured." : cleanString(error.message).slice(0, 500)
+      });
+    }
   }
   sendJson(res, 200, {
     success: true,
-    message: "If that email exists, a password reset token has been created.",
+    message: "If that email exists, a password reset link has been sent.",
     devResetToken
   });
-}, { auth: false });
+}, { auth: false, db: false });
 
 route("POST", "/api/auth/reset-password", async ({ req, db, body, res }) => {
   if (!rateLimit(req, "reset-password", 5, 15 * 60 * 1000)) return sendError(res, 429, "Too many reset attempts. Please try again later.");
@@ -2962,16 +3071,25 @@ function enforceSingleMasterDefault(db, record) {
   }
 }
 
-route("GET", "/api/master-data", async ({ db, query, res }) => {
-  sendJson(res, 200, { success: true, masterData: groupedMasterData(db, query.includeArchived === "true") });
-});
+route("GET", "/api/master-data", async ({ req, query, res }) => {
+  const current = await getCurrentFromMongo(req);
+  if (!current) return sendError(res, 401, "Authentication required.");
+  const database = await directDb();
+  const rows = (await database.collection(MONGO_COLLECTIONS.masterData).find({}).toArray()).map(cleanMongoDoc);
+  sendJson(res, 200, { success: true, masterData: groupedMasterData(normalizeDb({ masterData: rows }), query.includeArchived === "true") });
+}, { auth: false, db: false });
 
-route("GET", "/api/master-data/:type", async ({ db, params, query, res }) => {
+route("GET", "/api/master-data/:type", async ({ req, params, query, res }) => {
+  const current = await getCurrentFromMongo(req);
+  if (!current) return sendError(res, 401, "Authentication required.");
   const type = normalizeMasterDataType(params.type);
   if (!type) return sendError(res, 404, "Master data type not found.");
-  const rows = groupedMasterData(db, query.includeArchived === "true")[type] || [];
-  sendJson(res, 200, { success: true, type, items: rows });
-});
+  const database = await directDb();
+  const rows = (await database.collection(MONGO_COLLECTIONS.masterData).find({}).toArray()).map(cleanMongoDoc);
+  const grouped = groupedMasterData(normalizeDb({ masterData: rows }), query.includeArchived === "true");
+  const typedRows = grouped[type] || [];
+  sendJson(res, 200, { success: true, type, items: typedRows });
+}, { auth: false, db: false });
 
 route("POST", "/api/master-data", async ({ db, body, res }) => {
   const payload = masterDataPayload(body);
@@ -4928,9 +5046,11 @@ route("PATCH", "/api/settings", async ({ db, body, res }) => {
   sendJson(res, 200, { success: true, settings: getBranding(db) });
 });
 
-route("GET", "/api/settings/branding", async ({ db, res }) => {
-  sendJson(res, 200, { success: true, settings: getBranding(db) });
-}, { auth: false });
+route("GET", "/api/settings/branding", async ({ res }) => {
+  const database = await directDb();
+  const settings = cleanMongoDoc(await database.collection(SINGLETON_COLLECTIONS.businessSettings).findOne({ id: "business" }));
+  sendJson(res, 200, { success: true, settings: getBranding({ businessSettings: settings || defaultDb().businessSettings }) });
+}, { auth: false, db: false });
 
 route("PATCH", "/api/settings/branding", async ({ db, body, res }) => {
   const errors = validateColorPayload(body);

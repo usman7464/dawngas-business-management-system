@@ -7,6 +7,7 @@ const state = {
   ownerExists: true,
   settings: null,
   masterData: null,
+  resetToken: "",
   searchTimer: null,
   sidebarEscapeBound: false,
   sidebarResizeBound: false,
@@ -436,19 +437,21 @@ function confirmPermanentDelete(type, id) {
 
 async function init() {
   renderStartupLoading();
+  const params = new URLSearchParams(window.location.search);
+  state.resetToken = params.get("resetToken") || "";
   try {
     const exists = await api("/api/auth/owner-exists");
     state.ownerExists = exists.exists;
     await loadSettings();
-    await loadMasterData();
     const me = await api("/api/auth/me");
     state.user = me.user;
+    await loadMasterData();
     renderShell();
     await renderRoute();
   } catch {
     await loadSettings();
-    await loadMasterData();
-    renderAuth();
+    state.masterData = state.masterData || {};
+    renderAuth(state.resetToken ? "reset" : undefined);
   }
 }
 
@@ -628,7 +631,7 @@ function renderAuth(mode = state.ownerExists ? "login" : "setup") {
                 ? formInput("email", "Email", "", "email", "required")
                 : reset
                   ? `
-                    ${formInput("token", "Reset token", "", "text", "required")}
+                    ${formInput("token", "Reset token", state.resetToken, "text", "required")}
                     ${formInput("password", "New password", "", "password", "required minlength='8'")}
                   `
                   : `
@@ -669,6 +672,8 @@ function renderAuth(mode = state.ownerExists ? "login" : "setup") {
         return;
       } else if (reset) {
         await api("/api/auth/reset-password", { method: "POST", body: values });
+        state.resetToken = "";
+        if (window.location.search.includes("resetToken=")) window.history.replaceState({}, "", window.location.pathname + window.location.hash);
         toast("Password reset. Please log in.");
         renderAuth("login");
         return;

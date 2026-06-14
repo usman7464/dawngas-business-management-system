@@ -200,7 +200,10 @@ async function readStoredFile(record, options = {}) {
   const identifier = record.url || record.downloadUrl || record.pathname;
   if (!identifier) throw Object.assign(new Error("File location is missing."), { statusCode: 404 });
   const { get } = requireBlobClient();
-  const blob = await get(identifier);
+  const blob = await get(identifier, {
+    access: record.access === "public" ? "public" : "private",
+    token: process.env.BLOB_READ_WRITE_TOKEN
+  });
   if (blob && typeof blob.arrayBuffer === "function") return Buffer.from(await blob.arrayBuffer());
   if (blob && blob.body) return streamToBuffer(blob.body);
   if (blob && blob.stream) return streamToBuffer(blob.stream);

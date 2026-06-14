@@ -9,7 +9,7 @@
     "dev": "node server.js",
     "build": "node scripts/build-check.js",
     "vercel-build": "npm run build",
-    "check": "node --check server.js && node --check public/app.js && node --check services/storageService.js && node --check api/index.js",
+    "check": "node --check server.js && node --check public/app.js && node --check services/storageService.js && node --check services/emailService.js && node --check api/index.js",
     "smoke": "node scripts/smoke-test.js",
     "smoke-test": "node scripts/smoke-test.js",
     "audit:migration": "node scripts/audit-mongodb.js",
@@ -25,6 +25,7 @@
   "dependencies": {
     "@vercel/blob": "^2.4.0",
     "dotenv": "^17.4.2",
-    "mongodb": "^7.2.0"
+    "mongodb": "^7.2.0",
+    "resend": "^6.12.4"
   }
 }
