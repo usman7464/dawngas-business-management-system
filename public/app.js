@@ -604,12 +604,12 @@ function renderAuth(mode = state.ownerExists ? "login" : "setup") {
   const title = setup ? "Create owner account" : forgot ? "Reset access" : reset ? "Set new password" : "Owner login";
   const summary = setup
     ? "DawnGas allows one owner account. After setup, public signup closes automatically."
-    : "Secure access for the business owner only. No staff accounts or public dashboards.";
+    : "Secure access for the business owner only.";
   app.innerHTML = `
     <main class="auth-shell">
       <section class="auth-panel">
         <div class="auth-brand">${brandLogo(60)}</div>
-        <h1>Run the gas business from one secure dashboard.</h1>
+        <h1>Run your business from one secure dashboard.</h1>
         <p>${summary}</p>
       </section>
       <section class="auth-card">
